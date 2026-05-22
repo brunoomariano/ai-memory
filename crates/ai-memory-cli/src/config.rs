@@ -55,7 +55,34 @@ pub struct Config {
     /// Default is loopback only; to expose ai-memory on a LAN
     /// IP / `home.lan` / etc., add that authority here or pass it via
     /// `AI_MEMORY_ALLOWED_HOSTS=host1,host2,…` at startup.
+    ///
+    /// Accepts either a TOML/JSON sequence (`["a","b"]`) or a
+    /// comma-separated string (`"a,b"`) for ergonomics — env vars
+    /// can't be sequences without ugly escaping.
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
     pub allowed_hosts: Vec<String>,
+}
+
+/// Accept `Vec<String>` either as a real sequence (config.toml /
+/// JSON array) or as a comma-separated single string (env var).
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Single(String),
+        Many(Vec<String>),
+    }
+    Ok(match Either::deserialize(deserializer)? {
+        Either::Single(s) => s
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+        Either::Many(v) => v,
+    })
 }
 
 /// `[auth]` section of `config.toml`.
