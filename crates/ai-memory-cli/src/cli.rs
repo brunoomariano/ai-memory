@@ -227,7 +227,7 @@ pub struct InstallHooksArgs {
     #[arg(long)]
     pub hooks_dir: Option<PathBuf>,
     /// Server URL the hooks will POST to.
-    #[arg(long, default_value = "http://127.0.0.1:7777")]
+    #[arg(long, default_value = "http://127.0.0.1:49374")]
     pub server_url: String,
 }
 

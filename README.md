@@ -95,7 +95,7 @@ claude mcp add ai-memory -- ./target/release/ai-memory serve --transport stdio
 Or with HTTP transport for `mcp-inspector` / curl / a remote Claude Code:
 
 ```bash
-./target/release/ai-memory serve --transport http --bind 127.0.0.1:7777
+./target/release/ai-memory serve --transport http --bind 127.0.0.1:49374
 ```
 
 ### Local: Docker Compose
@@ -103,7 +103,7 @@ Or with HTTP transport for `mcp-inspector` / curl / a remote Claude Code:
 ```bash
 docker compose -f docker/docker-compose.yml up -d --build
 # State lives in the `ai-memory-data` named volume.
-# Attach Claude Code at http://localhost:7777/mcp
+# Attach Claude Code at http://localhost:49374/mcp
 ```
 
 ### Full CLI subcommand list

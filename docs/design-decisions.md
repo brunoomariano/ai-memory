@@ -12,7 +12,7 @@ A self-contained Rust binary that:
 2. Captures the agent's session **automatically** — no `write_note` ceremony — via hook scripts that the agent CLIs invoke (Claude Code lifecycle hooks, Codex hooks, OpenCode equivalents). Optional transcript-tail fallback for agents without hook APIs.
 3. Maintains a **Karpathy-style wiki**: incrementally-compiled markdown pages with cross-links, supersession, an `index.md` and a `log.md`.
 4. Serves retrieval via the MCP `tools/list` to coding agents: a handful of *narrow* tools, not 50.
-5. Ships a **Docker image** (`docker run -v ai-memory-data:/data -p 7777:7777 ai-memory`) so it can move between desktop and homelab.
+5. Ships a **Docker image** (`docker run -v ai-memory-data:/data -p 49374:49374 ai-memory`) so it can move between desktop and homelab.
 6. Is *self-healing*: schema migrations on startup, vector-index dim/provider check, write-ahead durability, periodic integrity audit, single-writer queue to avoid `database is locked`.
 
 ## 2. Hard requirements (extracted from the prompt)

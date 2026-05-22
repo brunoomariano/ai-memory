@@ -1,6 +1,6 @@
 #!/bin/sh
 # codex stop hook.
-SERVER="${AI_MEMORY_HOOK_URL:-http://127.0.0.1:7777}"
+SERVER="${AI_MEMORY_HOOK_URL:-http://127.0.0.1:49374}"
 curl -s --max-time 0.5 \
     -X POST "$SERVER/hook?event=stop&agent=codex" \
     -H "Content-Type: application/json" \

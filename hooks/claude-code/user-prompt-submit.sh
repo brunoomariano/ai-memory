@@ -1,6 +1,6 @@
 #!/bin/sh
 # Claude Code UserPromptSubmit hook.
-SERVER="${AI_MEMORY_HOOK_URL:-http://127.0.0.1:7777}"
+SERVER="${AI_MEMORY_HOOK_URL:-http://127.0.0.1:49374}"
 curl -s --max-time 0.5 \
     -X POST "$SERVER/hook?event=user-prompt&agent=claude-code" \
     -H "Content-Type: application/json" \

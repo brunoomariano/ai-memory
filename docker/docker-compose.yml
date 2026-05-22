@@ -3,7 +3,7 @@
 # Run from this directory:
 #   docker compose up -d
 # Attach Claude Code (or any MCP HTTP client) at
-#   http://localhost:7777/mcp
+#   http://localhost:49374/mcp
 # State persists in the `ai-memory-data` volume; move it between hosts
 # by stopping the container, `docker volume export` (or rsync the
 # mountpoint), and importing on the target.
@@ -20,9 +20,9 @@ services:
     volumes:
       - ai-memory-data:/data
     ports:
-      # Bind to loopback by default; flip to 0.0.0.0:7777 when serving
+      # Bind to loopback by default; flip to 0.0.0.0:49374 when serving
       # the homelab LAN. Keep behind a reverse proxy if you do.
-      - "127.0.0.1:7777:7777"
+      - "127.0.0.1:49374:49374"
     environment:
       - RUST_LOG=ai_memory=info,ai_memory_store=info,ai_memory_wiki=info,ai_memory_mcp=info,tracing_appender=warn
     healthcheck:

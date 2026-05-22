@@ -227,7 +227,7 @@ Lives at `<data_dir>/config.toml`. All values overridable by env vars
 prefixed `AI_MEMORY_*`.
 
 ```toml
-bind = "127.0.0.1:7777"
+bind = "127.0.0.1:49374"
 log_level = "info"
 
 [decay]                            # M8 retention params

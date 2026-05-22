@@ -2,7 +2,7 @@
 # Claude Code SessionStart hook.
 # Reads the event JSON from stdin and forwards it to a running
 # ai-memory server. Fire-and-forget: never blocks the agent.
-SERVER="${AI_MEMORY_HOOK_URL:-http://127.0.0.1:7777}"
+SERVER="${AI_MEMORY_HOOK_URL:-http://127.0.0.1:49374}"
 curl -s --max-time 0.5 \
     -X POST "$SERVER/hook?event=session-start&agent=claude-code" \
     -H "Content-Type: application/json" \

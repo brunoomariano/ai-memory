@@ -1,13 +1,13 @@
 # ai-memory configuration.
 #
 # All values can also be overridden via environment variables prefixed
-# `AI_MEMORY_` (e.g. `AI_MEMORY_BIND=0.0.0.0:7777`).
+# `AI_MEMORY_` (e.g. `AI_MEMORY_BIND=0.0.0.0:49374`).
 #
 # `data_dir` is intentionally absent here: it's set by `--data-dir`
 # or `AI_MEMORY_DATA_DIR`, and the config file lives inside it.
 
 # HTTP bind address used by `ai-memory serve`.
-bind = "127.0.0.1:7777"
+bind = "127.0.0.1:49374"
 
 # Default tracing filter (overridable by RUST_LOG).
 log_level = "info"

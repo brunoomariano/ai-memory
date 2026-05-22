@@ -37,7 +37,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
-            bind: "127.0.0.1:7777".into(),
+            bind: "127.0.0.1:49374".into(),
             log_level: "info".into(),
             decay: ai_memory_store::DecayParams::default(),
         }
@@ -112,7 +112,7 @@ mod tests {
     fn defaults_have_canonical_endings() {
         let cfg = Config::default();
         assert!(cfg.data_dir.ends_with("ai-memory"));
-        assert_eq!(cfg.bind, "127.0.0.1:7777");
+        assert_eq!(cfg.bind, "127.0.0.1:49374");
         assert_eq!(cfg.log_level, "info");
     }
 
