@@ -221,12 +221,12 @@ mod tests {
         let raw = serde_json::json!({
             "session_id": "abc-123",
             "cwd": "/tmp/x",
-            "model": "claude-sonnet-4-7"
+            "model": "claude-sonnet-4-6"
         });
         let env = HookEnvelope::from_query_and_body(q, raw);
         assert_eq!(env.event, HookEvent::SessionStart);
         assert_eq!(env.session_id.as_deref(), Some("abc-123"));
         assert_eq!(env.cwd.as_deref(), Some("/tmp/x"));
-        assert_eq!(env.title_hint.as_deref(), Some("claude-sonnet-4-7"));
+        assert_eq!(env.title_hint.as_deref(), Some("claude-sonnet-4-6"));
     }
 }

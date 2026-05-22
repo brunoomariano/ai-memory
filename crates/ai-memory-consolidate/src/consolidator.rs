@@ -354,7 +354,13 @@ fn build_request(
             role: Role::User,
             content: buf,
         }],
-        max_tokens: 1500,
+        // Sized for reasoning models too (Kimi / o3-style): each
+        // consolidation call may burn ~2k tokens on hidden reasoning
+        // before any visible output. With 4000 we leave ~2000 for the
+        // actual ConsolidatedPage JSON, which is plenty for our
+        // ~5 KB max body_markdown. Non-reasoning models stop early
+        // and don't pay extra for the higher cap.
+        max_tokens: 4000,
         temperature: Some(0.2),
     }
 }

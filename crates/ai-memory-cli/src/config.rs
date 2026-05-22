@@ -16,8 +16,16 @@ use figment::{
 use serde::{Deserialize, Serialize};
 
 /// Top-level runtime configuration.
+///
+/// `deny_unknown_fields` is intentionally NOT set: figment's
+/// `Env::prefixed("AI_MEMORY_")` pulls every env var with that prefix
+/// (including ones meant for the LLM/embedding factory:
+/// `AI_MEMORY_LLM_MODEL`, `AI_MEMORY_EMBEDDING_DIM`, …). Those keys are
+/// read directly via `std::env::var` in their own modules; they don't
+/// map into `Config` fields, but figment doesn't know that. Strict
+/// rejection here would crash on every deploy that uses LLM env vars.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct Config {
     /// Root data directory holding `wiki/`, `raw/`, `db/`, `models/`, `logs/`.
     pub data_dir: PathBuf,

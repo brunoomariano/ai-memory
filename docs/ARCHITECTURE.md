@@ -241,7 +241,7 @@ hard_delete_after_days = 180
 **LLM provider env** (opt-in):
 ```
 AI_MEMORY_LLM_PROVIDER     anthropic | openai | openai-compat
-AI_MEMORY_LLM_MODEL        e.g. claude-sonnet-4-7
+AI_MEMORY_LLM_MODEL        e.g. claude-sonnet-4-6
 ANTHROPIC_API_KEY / OPENAI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
 ```

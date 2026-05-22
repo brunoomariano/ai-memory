@@ -31,8 +31,8 @@ COPY --from=builder /usr/local/bin/ai-memory /usr/local/bin/ai-memory
 USER ai-memory
 ENV AI_MEMORY_DATA_DIR=/data
 WORKDIR /data
-EXPOSE 7777
+EXPOSE 49374
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/ai-memory", "status"]
 ENTRYPOINT ["/usr/local/bin/ai-memory"]
-CMD ["serve", "--transport", "http", "--bind", "0.0.0.0:7777"]
+CMD ["serve", "--transport", "http", "--bind", "0.0.0.0:49374"]

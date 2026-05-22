@@ -159,7 +159,7 @@ sensible defaults. Override with the corresponding env var.
 
 | Setting | Default | Why this default | Override |
 |---|---|---|---|
-| Anthropic LLM | `claude-sonnet-4-7` | Smart enough to summarise a session into coherent narrative; cheap enough to run on every session-end without thinking about it. Not a reasoning model — consolidation doesn't benefit from extended thinking. | `AI_MEMORY_LLM_MODEL` |
+| Anthropic LLM | `claude-sonnet-4-6` | Smart enough to summarise a session into coherent narrative; cheap enough to run on every session-end without thinking about it. Not a reasoning model — consolidation doesn't benefit from extended thinking. | `AI_MEMORY_LLM_MODEL` |
 | OpenAI LLM | `gpt-4o-mini` | Closest OpenAI equivalent to the Sonnet tier in price/quality. | `AI_MEMORY_LLM_MODEL` |
 | OpenAI embedding | `text-embedding-3-small` (1536-dim) | Best price/quality from OpenAI; 5× cheaper than `text-embedding-3-large` with marginal recall loss. | `AI_MEMORY_EMBEDDING_MODEL` + `AI_MEMORY_EMBEDDING_DIM` |
 | Voyage embedding | `voyage-3` (1024-dim) | Voyage's current general-purpose recommendation. | same |

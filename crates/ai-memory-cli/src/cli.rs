@@ -235,7 +235,7 @@ pub struct LlmTestArgs {
     /// Provider to test.
     #[arg(long, value_enum)]
     pub provider: LlmProviderChoice,
-    /// Model identifier (e.g. `claude-sonnet-4-7`, `gpt-4o-mini`, `llama3.1:8b`).
+    /// Model identifier (e.g. `claude-sonnet-4-6`, `gpt-4o-mini`, `llama3.1:8b`).
     #[arg(long)]
     pub model: String,
     /// Prompt to send.

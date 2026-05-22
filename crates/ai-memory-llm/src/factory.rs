@@ -63,8 +63,29 @@ pub fn provider_from_env() -> LlmResult<Option<ProviderConfig>> {
         },
         Err(_) => return Ok(None),
     };
-    let model = std::env::var("AI_MEMORY_LLM_MODEL")
-        .map_err(|_| LlmError::NotConfigured("AI_MEMORY_LLM_MODEL".into()))?;
+    // Sensible defaults per provider so the operator can set just the
+    // provider env var and get a reasonable model. Override via
+    // `AI_MEMORY_LLM_MODEL`. We pick the cheapest model that is still
+    // smart enough to summarise a session into a coherent wiki page;
+    // reasoning models are deliberately avoided in the defaults
+    // because consolidation runs frequently and silently.
+    let model = match std::env::var("AI_MEMORY_LLM_MODEL") {
+        Ok(s) if !s.is_empty() => s,
+        _ => match provider {
+            ProviderChoice::Anthropic => "claude-sonnet-4-6".to_string(),
+            ProviderChoice::OpenAi => "gpt-4o-mini".to_string(),
+            // openai-compat covers Ollama / vLLM / LM Studio / OpenRouter.
+            // What's available depends entirely on the user's setup, so
+            // refuse to start without an explicit choice.
+            ProviderChoice::OpenAiCompat => {
+                return Err(LlmError::NotConfigured(
+                    "AI_MEMORY_LLM_MODEL must be set explicitly for openai-compat \
+                     (no safe default for self-hosted / aggregator endpoints)"
+                        .into(),
+                ));
+            }
+        },
+    };
     let base_url = std::env::var("AI_MEMORY_LLM_BASE_URL").ok();
     let api_key = match provider {
         ProviderChoice::Anthropic => std::env::var("ANTHROPIC_API_KEY")

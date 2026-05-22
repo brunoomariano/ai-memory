@@ -1,0 +1,175 @@
+# Deploying ai-memory to a homelab
+
+This walks through the pattern documented in `bin/deploy`. The end
+state is: a long-lived ai-memory container on your homelab host,
+reachable on your LAN at `http://<host>:49374/mcp`, configured with
+your LLM/embedding API keys, with backups handled by whatever you
+already use for `/var/opt/docker/...`.
+
+## What gets committed vs. what stays local
+
+The repo ships **templates only**. The real files with your homelab
+specifics and API keys live next to them with the `.example` suffix
+stripped, and are gitignored.
+
+| Committed (template) | Live (gitignored) | What it holds |
+|---|---|---|
+| `bin/deploy` | (the script itself; safe to commit) | The build/push/restart logic |
+| `bin/deploy.env.example` | `bin/deploy.env` | `SERVER`, `DEPLOY_DIR`, `IMAGE` |
+| `docker/docker-compose.prod.yml.example` | `docker/docker-compose.prod.yml` | Image tag, port mapping, volume path |
+| `docker/.env.production.example` | `docker/.env.production` | LLM + embedding API keys |
+
+`.gitignore` excludes the live files. If you ever see one staged,
+something has drifted — unstage before committing.
+
+## First-time setup (one-time)
+
+```bash
+# 1. Stamp your homelab values into the local config.
+cp bin/deploy.env.example bin/deploy.env
+$EDITOR bin/deploy.env                # fill SERVER / DEPLOY_DIR / IMAGE
+
+cp docker/docker-compose.prod.yml.example docker/docker-compose.prod.yml
+$EDITOR docker/docker-compose.prod.yml   # set the image tag + adjust ports if needed
+
+cp docker/.env.production.example docker/.env.production
+$EDITOR docker/.env.production        # fill API keys; pick LLM provider + model
+
+# 2. Create the deploy dir on the homelab. Source bin/deploy.env so
+#    SERVER/DEPLOY_DIR are exported in this shell.
+source bin/deploy.env
+ssh "$SERVER" "sudo mkdir -p $DEPLOY_DIR/data && \
+               sudo chown -R 1000:1000 $DEPLOY_DIR"
+
+# 3. Copy the compose + env to the homelab.
+scp docker/docker-compose.prod.yml "$SERVER:$DEPLOY_DIR/docker-compose.yml"
+scp docker/.env.production         "$SERVER:$DEPLOY_DIR/.env.production"
+
+# 4. Run the first deploy.
+bin/deploy
+```
+
+After step 4, the container should be running. Verify:
+
+```bash
+curl http://<homelab>:49374/mcp
+# Expect a JSON-RPC error (which means the port is reachable and the
+# server is responding). "Connection refused" means the container
+# isn't up or the port mapping is wrong.
+
+ssh "$SERVER" "docker inspect --format='{{.State.Health.Status}}' ai-memory"
+# Expect: healthy
+```
+
+## Routine deploys
+
+After the first-time setup, every subsequent deploy is just:
+
+```bash
+bin/deploy
+```
+
+It builds the image locally, pushes to your registry, pulls on the
+homelab, and restarts. The compose file + env file on the homelab are
+unchanged between deploys; if you ever need to change them, scp the
+new copy + re-run `bin/deploy`.
+
+## Updating API keys
+
+```bash
+$EDITOR docker/.env.production
+scp docker/.env.production "$SERVER:$DEPLOY_DIR/.env.production"
+ssh "$SERVER" "cd $DEPLOY_DIR && docker compose up -d"
+```
+
+`docker compose up -d` reads the env file and recreates the container
+with the new values. No rebuild needed.
+
+## LLM provider choices
+
+The `.env.production.example` defaults to **Kimi 2.6 via OpenRouter**
+(openai-compat transport, $0.73/$3.49 per million tokens). Reasonable
+alternatives:
+
+| Provider | Model | Approx. cost / consolidation | Notes |
+|---|---|---|---|
+| openai-compat (OpenRouter) | `moonshotai/kimi-k2.6` | ~$0.013 | Reasoning model; latency ~2-3 min per consolidation. Fine because consolidation is fire-and-forget. |
+| anthropic | `claude-sonnet-4-6` | ~$0.02 | Faster (~15s), not a reasoning model. Smarter on average but more expensive. |
+| openai | `gpt-4o-mini` | ~$0.002 | Cheapest mainstream option. Decent quality. |
+| openai-compat (Ollama) | `qwen2.5-coder:14b` | $0 | Self-hosted. Set `AI_MEMORY_LLM_BASE_URL=http://host.docker.internal:11434/v1`. Quality depends on the model. |
+
+ai-memory's consolidator uses OpenAI's `json_schema` strict mode for
+structured output. Most modern models honour this, but if you switch
+to a niche local model, run a quick `ai-memory llm-test` (with a
+structured prompt) before trusting it.
+
+## Backups
+
+The data dir is whatever you mounted in `docker-compose.prod.yml`
+(default: `/var/opt/docker/utils/ai-memory/data/`). It contains:
+
+```
+data/
+├── wiki/    # markdown — back up with rsync or git push to a remote
+├── raw/    # immutable session log archive
+├── db/     # memory.sqlite (FTS5 + page_embeddings)
+├── logs/   # daily rolling tracing
+└── models/ # reserved for future local embedders
+```
+
+For point-in-time consistency:
+
+```bash
+ssh "$SERVER" "docker exec ai-memory /usr/local/bin/ai-memory backup --to /data/snapshot-$(date +%F).tar.gz"
+scp "$SERVER:$DEPLOY_DIR/data/snapshot-$(date +%F).tar.gz" ./backups/
+```
+
+The `ai-memory backup` command uses SQLite's online backup API so
+writes during the snapshot are coherent.
+
+## Rolling back
+
+```bash
+ssh "$SERVER" "cd $DEPLOY_DIR && \
+               docker tag $IMAGE $IMAGE-rollback && \
+               docker pull $IMAGE@sha256:<old-digest>"
+ssh "$SERVER" "cd $DEPLOY_DIR && docker compose up -d"
+```
+
+The simplest rollback is to bring back an older image by digest. We
+don't ship a `bin/rollback` because the right way is to keep the
+prior image tag handy before each deploy (Docker Hub keeps every
+push by digest for free).
+
+## Watching logs
+
+```bash
+ssh "$SERVER" "docker logs -f --tail 100 ai-memory"
+```
+
+Or browse the daily rolling logs on the host:
+
+```bash
+ssh "$SERVER" "ls -la $DEPLOY_DIR/data/logs/"
+ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
+```
+
+## Troubleshooting
+
+- **`Connection refused`** on `curl http://<host>:49374/mcp`: the
+  container isn't up, or the port mapping is bound to `127.0.0.1`
+  instead of `0.0.0.0`. Check `docker ps` on the homelab.
+- **`unhealthy`** status: the container is running but its embedded
+  `ai-memory status` healthcheck is failing. Most likely the data
+  dir's permissions don't match the container's user (uid 1000). Fix
+  with `sudo chown -R 1000:1000 $DEPLOY_DIR/data` on the host.
+- **Embedding mismatch refusing to start**: ai-memory refuses to boot
+  when the configured `(provider, model, dim)` for embeddings doesn't
+  match the stored pages' embeddings. Either revert the change or run
+  `ai-memory embed --reembed` (after starting with the old config or
+  doing a manual SQL fix) to migrate.
+- **Container restart loop**: check
+  `docker logs ai-memory` — the `ai-memory starting` line at the top
+  reports the resolved config; a missing required env var (e.g.
+  `LLM_API_KEY` with `openai-compat` selected but no model) will fail
+  here with a clear error.

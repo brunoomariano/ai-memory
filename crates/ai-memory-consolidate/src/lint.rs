@@ -191,7 +191,10 @@ async fn contradiction_pass(
             role: Role::User,
             content: prompt,
         }],
-        max_tokens: 2000,
+        // Same reasoning-model headroom rule as the consolidator —
+        // reasoning models can spend ~2k tokens before any visible
+        // findings JSON appears.
+        max_tokens: 4000,
         temperature: Some(0.1),
     };
     let report: LintReport = complete_structured(&*provider, request).await?;
