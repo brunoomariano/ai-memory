@@ -19,6 +19,9 @@ COPY crates ./crates
 # if a declared member doesn't exist on disk). Copy the dir so the
 # manifest resolves; `-p ai-memory-cli` keeps the binary build narrow.
 COPY evals ./evals
+# `docs/logo*.png` are include_bytes!'d by ai-memory-web's static
+# routes at compile time, so they must be in the build context.
+COPY docs ./docs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/work/target \
     cargo build --release -p ai-memory-cli \
