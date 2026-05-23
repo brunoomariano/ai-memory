@@ -27,12 +27,13 @@ struct EmbedRequest {
 /// response.
 pub async fn run(_config: &Config, args: EmbedArgs) -> Result<()> {
     let endpoint = ServerEndpoint::from_env();
+    let project = super::resolve_project_name(args.project.as_deref())?;
     let report: serde_json::Value = post_json(
         &endpoint,
         "/admin/embed",
         &EmbedRequest {
             workspace: args.workspace,
-            project: args.project,
+            project,
             // The CLI flag was historically named `force`; the server
             // field is `reembed` — map them here.
             reembed: args.force,

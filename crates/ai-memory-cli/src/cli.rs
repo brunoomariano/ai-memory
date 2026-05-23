@@ -122,13 +122,20 @@ pub struct BootstrapArgs {
     /// any subdir of the project works).
     #[arg(long)]
     pub repo_path: Option<PathBuf>,
-    /// Workspace + project labels stamped on the generated pages.
-    /// Match what your `ai-memory serve` uses so the bootstrap pages
-    /// live in the same wiki silo as future captured sessions.
+    /// Workspace name. Defaults to `default` (the single workspace
+    /// all hook-captured sessions land in today).
     #[arg(long, default_value = "default")]
     pub workspace: String,
-    #[arg(long, default_value = "scratch")]
-    pub project: String,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the resolved repo path — same heuristic the hook router uses
+    /// to bucket per-cwd observations, so the bootstrap pages land
+    /// in the same project as future session captures.
+    ///
+    /// Dot-prefixed dirs are preserved verbatim — `~/.config` becomes
+    /// project `.config`, matching what the router does for sessions
+    /// launched from there. Pass `--project` explicitly to override.
+    #[arg(long)]
+    pub project: Option<String>,
     /// Maximum total tokens of source text sent to the LLM in one
     /// run. When the collected sources exceed this, lower-priority
     /// inputs (older git commits, then code module headers, then
@@ -364,9 +371,12 @@ pub struct EmbedArgs {
     /// Workspace name (auto-created if absent).
     #[arg(long, default_value = "default")]
     pub workspace: String,
-    /// Project name within the workspace (auto-created if absent).
-    #[arg(long, default_value = "scratch")]
-    pub project: String,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo). Matches the
+    /// hook router's per-cwd convention so this command targets the
+    /// same project sessions write into.
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 /// Arguments for `forget-sweep`.
@@ -378,9 +388,10 @@ pub struct ForgetSweepArgs {
     /// Workspace name (auto-created if absent).
     #[arg(long, default_value = "default")]
     pub workspace: String,
-    /// Project name within the workspace (auto-created if absent).
-    #[arg(long, default_value = "scratch")]
-    pub project: String,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 /// Arguments for `lint`.
@@ -392,9 +403,10 @@ pub struct LintArgs {
     /// Workspace name (auto-created if absent).
     #[arg(long, default_value = "default")]
     pub workspace: String,
-    /// Project name within the workspace (auto-created if absent).
-    #[arg(long, default_value = "scratch")]
-    pub project: String,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 /// Arguments for `llm-test`.

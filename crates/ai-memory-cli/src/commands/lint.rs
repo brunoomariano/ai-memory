@@ -22,12 +22,13 @@ struct LintRequest {
 /// response.
 pub async fn run(_config: &Config, args: LintArgs) -> Result<()> {
     let endpoint = ServerEndpoint::from_env();
+    let project = super::resolve_project_name(args.project.as_deref())?;
     let report: serde_json::Value = post_json(
         &endpoint,
         "/admin/lint",
         &LintRequest {
             workspace: args.workspace,
-            project: args.project,
+            project,
             dry_run: args.dry_run,
         },
     )

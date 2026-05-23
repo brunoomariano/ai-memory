@@ -41,6 +41,10 @@ pub async fn run(_config: &Config, args: BootstrapArgs) -> Result<()> {
             .context("auto-detecting --repo-path (no .git found at or above CWD)")?,
     };
 
+    // ---- project — auto-derive from repo basename if absent -------
+    let project = super::resolve_project_name(args.project.as_deref())?;
+    info!(workspace = %args.workspace, project = %project, repo_path = %repo_path.display(), "bootstrap target");
+
     // ---- collect sources locally ----------------------------------
     let sources = collect_sources(
         &repo_path,
@@ -55,7 +59,7 @@ pub async fn run(_config: &Config, args: BootstrapArgs) -> Result<()> {
     // ---- POST to server -------------------------------------------
     let body = serde_json::json!({
         "workspace": args.workspace,
-        "project": args.project,
+        "project": project,
         "sources": sources,
         "max_input_tokens": args.max_input_tokens,
         "dry_run": args.dry_run,
@@ -63,7 +67,7 @@ pub async fn run(_config: &Config, args: BootstrapArgs) -> Result<()> {
     });
     let outcome: BootstrapOutcome = post_json(&ep, "/admin/bootstrap", &body).await?;
 
-    print_human_report(&outcome, &args.workspace, &args.project);
+    print_human_report(&outcome, &args.workspace, &project);
     let report = serde_json::to_string_pretty(&outcome)?;
     println!("\n--- machine-readable ---\n{report}");
     Ok(())
