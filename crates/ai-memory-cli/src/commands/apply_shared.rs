@@ -104,19 +104,25 @@ fn backup_path_for(path: &Path) -> PathBuf {
     PathBuf::from(bak)
 }
 
-/// Tempfile + rename atomic write. Sibling tempfile so the rename
-/// is on the same filesystem (avoids cross-mount EXDEV).
+/// Tempfile + rename atomic write. The tempfile MUST land in the
+/// same directory as the target so `rename(2)` stays intra-filesystem
+/// — otherwise we get EXDEV ("Invalid cross-device link").
+///
+/// This used to fall back to `tempfile()` (i.e. `$TMPDIR`, typically
+/// `/tmp` on tmpfs) when the target had no parent component, but
+/// that breaks any relative path like `CLAUDE.md` whose parent is
+/// `""` (empty) — the project lives on a different filesystem than
+/// `/tmp` in just about every realistic setup. Treat empty parent
+/// as `.` (current directory) instead.
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut tmp = match parent {
-        Some(p) => tempfile::Builder::new()
-            .prefix(".ai-memory-apply-tmp.")
-            .tempfile_in(p),
-        None => tempfile::Builder::new()
-            .prefix(".ai-memory-apply-tmp.")
-            .tempfile(),
-    }
-    .with_context(|| format!("creating tempfile next to {}", path.display()))?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".ai-memory-apply-tmp.")
+        .tempfile_in(parent)
+        .with_context(|| format!("creating tempfile next to {}", path.display()))?;
     tmp.write_all(content.as_bytes())
         .context("writing tempfile content")?;
     tmp.as_file().sync_data().context("fsync tempfile")?;

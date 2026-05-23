@@ -30,3 +30,6 @@ perf.data*
 .ai-jail
 .claude/
 evals/runs/
+
+# ai-memory atomic-write backups (apply_atomic in apply_shared.rs)
+*.bak-*
