@@ -29,28 +29,56 @@ const MARKER_END: &str = "<!-- ai-memory:end -->";
 /// The canonical snippet body. Lives in code so `install-instructions`
 /// always writes the current recommended copy.
 const SNIPPET_BODY: &str = r#"
-## Long-term memory
+## Long-term memory (ai-memory)
 
 This project uses [ai-memory](https://github.com/akitaonrails/ai-memory)
-for cross-session continuity. Lifecycle hooks automatically capture
-every prompt + tool call, and the SessionStart hook surfaces any
-pending cross-agent handoff into the next session's prompt — neither
-needs your prompting.
+for cross-session continuity. **Lifecycle hooks already capture every
+prompt + tool call automatically.** You never need to manually write
+notes; the SessionStart hook auto-fetches pending handoffs and the
+SessionEnd hook auto-consolidates. Just *use* the read tools.
 
-Beyond that, **proactively use the MCP tools** when the conversation
-calls for it:
+### When to reach for each tool
 
-- `memory_query` — before proposing architecture, when the user
-  references prior work you don't recognise, or when investigating a
-  bug that might have a known root cause.
-- `memory_recent` — at session start to scan the last few pages of
-  context (complements the auto-injected handoff).
-- `memory_handoff_begin` — optional; only if you want to capture
-  extra context beyond what the SessionEnd hook captures by default.
+The user can express any of the intents below in plain English —
+match the intent to the tool. They do not need to name the tool.
+
+| User says / situation | Tool |
+|---|---|
+| "have we discussed X?" / "search memory for Y" / before proposing architecture | `memory_query` |
+| "what's been going on" / "show recent activity" (light) | `memory_recent` |
+| "is ai-memory healthy?" / "how big is the wiki?" | `memory_status` |
+| "give me the stats" / structured snapshot for the agent to consume | `memory_briefing` |
+| "catch me up" / "I've been away" / "what's important right now?" / open-ended exploration | `memory_explore` |
+| "where did we leave off?" / first turn of a new session | `memory_handoff_accept` |
+| "save context for the next session" / wrapping up | `memory_handoff_begin` |
+| "consolidate this session" / "compile what we learned" (usually automatic) | `memory_consolidate` |
+| "audit the wiki" / "find contradictions" / "what rules should we add?" | `memory_lint` |
+| "prune old pages" / "memory cleanup" | `memory_forget_sweep` |
+
+`memory_explore` is the right default for the "I want to know what's
+going on" use case — it returns a prose digest whose verbosity
+scales automatically to how long it's been since the last activity
+(< 1 h → one line; > 30 days → full catchup).
+
+### When you write a project rule, write it here
 
 If you're about to write a durable project rule ("always X", "never
-Y"), this file is where it belongs — ai-memory's lint pass will
-suggest the same.
+Y", "all PRs must …"), this file (CLAUDE.md / AGENTS.md) is where
+the rule belongs. ai-memory's lint pass surfaces the same hint
+automatically when a `kind: rule` page lands in `_rules/`.
+
+### Refreshing this snippet
+
+This block is maintained by ai-memory. To re-sync it with the
+latest binary's recommended copy (e.g. when new tools ship), run:
+
+```
+ai-memory install-instructions
+```
+
+It's idempotent: re-runs replace the block bracketed by
+`<!-- ai-memory:start -->` / `<!-- ai-memory:end -->` markers
+without disturbing the rest of the file.
 "#;
 
 /// Run the `install-instructions` subcommand.

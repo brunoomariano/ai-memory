@@ -16,13 +16,48 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
-/// Instructions surfaced to clients via `ServerInfo`. Short and
-/// agent-readable — Claude Code / Codex will see this in their session
-/// preamble.
-pub const MEMORY_INSTRUCTIONS: &str = "Long-term memory for coding agents. Use \
-memory_query for free-text search, memory_recent to peek at recently-changed \
-pages, and memory_status for counts. All tools are read-only; writes happen \
-automatically via hooks and the watcher.";
+/// Instructions surfaced to clients via `ServerInfo`. Sent on every
+/// MCP handshake so Claude Code / Codex / OpenCode see this in their
+/// session preamble. Maps conversational triggers to tool names so
+/// the agent can route natural-language requests without the user
+/// having to know the tool name or schema.
+pub const MEMORY_INSTRUCTIONS: &str = "\
+Long-term memory for the current project. Lifecycle hooks already \
+capture every prompt + tool call automatically — you do NOT need to \
+write anything by hand. Use these tools when the conversation calls \
+for them:\n\
+\n\
+- `memory_query` — when the user references prior work you don't \
+  recognise, or asks 'have we done / discussed X', or you're about \
+  to propose architecture (always check first).\n\
+- `memory_recent` — at session start, or when the user asks 'what's \
+  been going on lately'. Returns the N most-recent pages.\n\
+- `memory_status` — when the user asks 'is ai-memory healthy' or \
+  'how big is the knowledge base'. Returns lifetime counts.\n\
+- `memory_briefing` — when the user wants a STRUCTURED snapshot \
+  (counts + 7d/30d activity + rules + recent pages, JSON, no LLM \
+  call). Use over memory_status when more detail is wanted.\n\
+- `memory_explore` — when the user wants a PROSE digest. \
+  Calibrates verbosity to time since last activity: 'fresh' → one \
+  line, 'stale' (>30d) → full catchup. Accepts an optional `focus` \
+  arg. Use over memory_briefing when the user asks open-ended \
+  questions like 'catch me up' or 'what's important right now'.\n\
+- `memory_handoff_accept` — when the user asks 'where did we leave \
+  off'. The SessionStart hook also auto-fetches this.\n\
+- `memory_handoff_begin` — when the user is wrapping up and you \
+  want to ensure the next agent has context (the SessionEnd hook \
+  also auto-captures this).\n\
+- `memory_consolidate` — when the user asks to compile session \
+  observations into wiki pages (usually automatic at session end).\n\
+- `memory_lint` — when the user asks to audit the wiki for stale \
+  pages, contradictions, or rule suggestions.\n\
+- `memory_forget_sweep` — when the user wants to prune old / cold \
+  pages (idempotent, supports dry-run).\n\
+\n\
+To configure ai-memory's CLAUDE.md guidance for this project, run \
+`ai-memory install-instructions` from the CLI — that updates this \
+text in your project's CLAUDE.md / AGENTS.md so the model has the \
+same routing table in its system prompt.";
 
 /// MCP server backed by the ai-memory store.
 #[derive(Clone)]
