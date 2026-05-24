@@ -21,8 +21,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Gate the publish on the Docker Hub secrets actually being present, so a
+  # fresh clone (or a fork) doesn't get a red failing run on every tag. The
+  # docker job activates automatically once DOCKERHUB_USERNAME + _TOKEN are
+  # set in repo Settings → Secrets and variables → Actions.
+  check-secrets:
+    name: check publish credentials
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ] && [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN not set — skipping image publish. Add them in repo Settings → Secrets and variables → Actions to enable tag-triggered publishing."
+          fi
+
   docker:
     name: docker build + push
+    needs: check-secrets
+    if: needs.check-secrets.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
