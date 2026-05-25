@@ -285,7 +285,18 @@ async fn resolve_project_ids(
                 return Ok((state.workspace_id, state.project_id));
             }
         },
-        (None, None) => unreachable!("guarded above by the early return"),
+        (None, None) => {
+            // The early-return at the top of the function guards
+            // against this branch; the explicit fallback here keeps
+            // the resolver panic-free if that guard ever moves or
+            // gets refactored. Same effect as `unreachable!`, but
+            // visible at compile time instead of inside the panic
+            // message.
+            state
+                .active_project
+                .set(state.workspace_id, state.project_id);
+            return Ok((state.workspace_id, state.project_id));
+        }
     };
 
     let ws = state

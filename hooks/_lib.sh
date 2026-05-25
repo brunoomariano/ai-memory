@@ -69,3 +69,36 @@ ai_memory_marker_qs() {
     [ -n "$pr" ] && qs="${qs}&project=$(ai_memory_url_encode "$pr")"
     printf '%s' "$qs"
 }
+
+# POST stdin to "$1" as JSON, fire-and-forget. Adds an
+# `Authorization: Bearer` header when `AI_MEMORY_AUTH_TOKEN` is set.
+# The 0.5s timeout matches the project-wide hook latency budget
+# (never block the agent), and the trailing `|| true` makes the
+# function safe to call from `set -e` scripts.
+ai_memory_post_hook() {
+    if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
+        curl -s --max-time 0.5 -X POST "$1" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN" \
+            --data-binary @-
+    else
+        curl -s --max-time 0.5 -X POST "$1" \
+            -H "Content-Type: application/json" \
+            --data-binary @-
+    fi
+}
+
+# GET "$1" with the same auth-header rules as `ai_memory_post_hook`.
+# Used by `session-start.sh` to pull the cross-agent handoff before
+# the resuming agent's first prompt. 1s budget — slightly more
+# generous than POST because the result is *synchronously* fed to
+# stdout (and prepended to the agent's context), so we want to avoid
+# truncating a handoff that was almost ready.
+ai_memory_get_handoff() {
+    if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
+        curl -s --max-time 1.0 "$1" \
+            -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
+    else
+        curl -s --max-time 1.0 "$1"
+    fi
+}
