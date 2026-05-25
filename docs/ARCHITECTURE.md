@@ -178,9 +178,17 @@ invariants below.
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. |
 | `memory_install_self_routing` | read-only | Return the canonical routing snippet for CLAUDE.md / AGENTS.md. |
 
-All MCP tools carry `readOnlyHint` / `destructiveHint` annotations so
-the calling agent can pick safely. Parameter aliases (`query|q|search`,
-`workspace|ws`) absorb LLM verbal variance.
+`memory_briefing`, `memory_explore` and `memory_install_self_routing`
+post-date the original "narrow on purpose" cut (§10 of
+`design-decisions.md`): briefing/explore separate the structured vs.
+prose halves of "what's going on", and `memory_install_self_routing`
+exists for the meta case where the agent must re-write its own routing
+rules into a project's `CLAUDE.md` / `AGENTS.md`. The narrow-surface
+discipline still holds — every new tool has to earn its slot — but the
+v1 count is 11, not 10.
+
+All MCP tools accept verbal-variance parameter aliases (`query|q|search`,
+`workspace|ws`) so the calling agent can phrase arguments naturally.
 
 ## CLI subcommand surface (17 commands)
 

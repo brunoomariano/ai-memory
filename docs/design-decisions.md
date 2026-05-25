@@ -112,7 +112,7 @@ Adopt agentmemory's tier model **but** keep the surface narrow:
 | Tier | What it is | Lifetime | Decay |
 |---|---|---|---|
 | **Working** | Current session: last N observations, last user prompt, current files | Until session end | Drop on session end (kept in DB for forensics, but excluded from default recall) |
-| **Episodic** | Per-session summaries with concept tags, files-touched, decisions made | 30 days hot, 180 days cold, then evict if cold-score < threshold | Salience × exp(-λΔt) + Σ(σ/days_since_access) - agentmemory's formula, validated |
+| **Episodic** | Per-session summaries with concept tags, files-touched, decisions made | 30 days hot, 180 days cold, then evict if cold-score < threshold | `salience · exp(-λ · age_days) + σ · log(1 + access_count) · exp(-μ · days_since_access)`. Code of record: [`crates/ai-memory-store/src/decay.rs`](../crates/ai-memory-store/src/decay.rs). |
 | **Semantic** | Distilled facts/preferences/architecture notes - the wiki pages themselves | Indefinite, supersedeable | Versioned in place: old `is_latest=false`, new `supersedes=old_id` |
 | **Procedural** | Repeated patterns extracted from episodic clusters (`pattern` type with frequency ≥ 2) | Indefinite | Frequency-decay if not re-observed in N days |
 
@@ -153,22 +153,21 @@ agentmemory has this informally (`/handoff` skill); we make it explicit from day
 
 ## 10. MCP tool surface - narrow on purpose
 
-basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a result. Ship **at most 10 v1 tools**:
+basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a result. v1 ships 11 tools:
 
 | Tool | Purpose | Annotation |
 |---|---|---|
-| `memory_remember` | Manual capture (rare) | destructive, idempotent |
-| `memory_query` | Search + retrieve, auto-routed | read-only |
-| `memory_recent` | Recent activity, optionally for-this-project | read-only |
-| `memory_handoff_begin` | Mark session boundary, write handoff | destructive |
-| `memory_handoff_accept` | Fetch+ack open handoff | destructive |
-| `memory_forget` | Explicit user forget | destructive |
-| `memory_session_summary` | Internal - used by stop hook | destructive (internal) |
-| `memory_consolidate` | Internal - used by scheduler | destructive (internal) |
-| `memory_lint` | Internal - used by scheduler | destructive (internal) |
+| `memory_query` | Search + retrieve, FTS5 + optional hybrid RRF | read-only |
+| `memory_recent` | Most-recently-updated `is_latest=1` pages for the project | read-only |
 | `memory_status` | Health, counts, last-consolidation-at | read-only |
-
-Internal tools are gated by `tools/list` annotation; agents see only the user-visible ones unless `expose=all` is set. Every tool has MCP `readOnlyHint`/`destructiveHint`/`idempotentHint` (basic-memory pattern; lesson from #818 - be careful with `bool | None` aliases on tool params).
+| `memory_briefing` | Structured zero-LLM snapshot: 7d/30d windows, pending handoffs, recent pages, `_rules/` | read-only |
+| `memory_explore` | LLM-composed prose digest over `memory_briefing`; degrades to JSON without a provider | read-only |
+| `memory_handoff_begin` | Mark session boundary, write handoff | destructive |
+| `memory_handoff_accept` | Fetch + ack the latest open handoff | destructive |
+| `memory_consolidate` | LLM-driven page rewrite (`multi_page=true` for atomic fan-out) | destructive |
+| `memory_forget_sweep` | Retention sweep (M8); soft-delete below cold threshold; `dry_run=true` previews | destructive |
+| `memory_lint` | Rule-based + optional LLM contradiction findings → `wiki/_lint/<date>.md` | destructive |
+| `memory_install_self_routing` | Returns the canonical CLAUDE.md / AGENTS.md routing block + per-agent filename hints | read-only |
 
 Tool param aliases: accept `query|q|search`, `project|workspace`, `dir|directory` - basic-memory's `AliasChoices` pattern works for LLM resilience.
 
