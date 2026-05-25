@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- `.ai-memory.toml` marker file lets a directory tree declare its
+  `workspace` (required) and `project` (optional) without depending on
+  `basename($cwd)`. Lifecycle hook scripts walk up from `cwd` to find
+  the closest marker and forward the declared names as
+  `&workspace=X&project=Y` query params on `POST /hook` and
+  `GET /handoff`. Server accepts the new params as optional overrides;
+  absent marker means the previous behaviour (`workspace = "default"`,
+  `project = basename(cwd)`) — fully backward compatible. See
+  [`docs/marker-file.md`](docs/marker-file.md).
 - Oh My Pi / OMP is now a first-class integration: `install-mcp --client pi`
   and `--client omp` write native `~/.omp/agent/mcp.json` config, while
   `install-hooks --agent omp` and `--agent pi` write the TypeScript extension

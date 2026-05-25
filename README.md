@@ -57,6 +57,10 @@ priors are at the [bottom](#influences-and-prior-art).
   "where you left off" block before its first prompt.
 - **Per-project isolation by construction.** Each project lives at
   `<wiki_root>/<workspace_id>/<project_id>/…` keyed by stable UUIDs.
+  By default `workspace = "default"` and `project = basename($cwd)`.
+  Drop a [`.ai-memory.toml` marker file](docs/marker-file.md) in any
+  ancestor directory to override either — perfect for multi-client
+  consultancies, work/personal split, or mono-repos.
   Same page path can exist in two projects without collision; a
   rename is one column update; a purge is one `rm -rf`.
 - **Karpathy-style LLM wiki.** Pages are compiled from observations

@@ -976,27 +976,49 @@ fn stage_hook_scripts(source_dir: &Path, agent_label: &str) -> Result<PathBuf> {
         if !from.is_file() || !is_hook_script_file(&from) {
             continue;
         }
-        let to = dest_root.join(from.file_name().context("bad source file name")?);
-        fs::copy(&from, &to)
-            .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
-        // Preserve the executable bit — the scripts need to be
-        // directly invokable by the agent's hook runner.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&to)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&to, perms)?;
-        }
+        copy_hook_file(&from, &dest_root)?;
         copied += 1;
     }
 
     copy_support_hook_scripts(source_dir, &dest_root)?;
 
+    // Stage the shared `_lib.sh` helper alongside the event scripts so
+    // they can `. "$(dirname "$0")/_lib.sh"` without depending on the
+    // user's PATH or repo layout. The helper lives ONCE in
+    // `hooks/_lib.sh` (one parent up from the agent-specific dir) —
+    // staging it here is what keeps every agent's runtime view
+    // consistent with the source of truth.
+    if let Some(shared) = source_dir.parent().map(|p| p.join("_lib.sh"))
+        && shared.is_file()
+    {
+        copy_hook_file(&shared, &dest_root)?;
+    }
+
     eprintln!("✓ staged {copied} hook script(s) → {}", dest_root.display());
     Ok(dest_root)
 }
 
+/// Copy a single hook file (event script or shared `_lib.sh`) into the
+/// staging dir, preserving the executable bit on Unix. Centralised so
+/// the script bulk-copy and the `_lib.sh` companion follow the same
+/// rules without duplicating permission-handling.
+fn copy_hook_file(from: &Path, dest_root: &Path) -> Result<()> {
+    let to = dest_root.join(from.file_name().context("bad source file name")?);
+    fs::copy(from, &to)
+        .with_context(|| format!("copying {} → {}", from.display(), to.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&to)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&to, perms)?;
+    }
+    Ok(())
+}
+
+/// Copy the optional `lib/` support directory (currently PowerShell
+/// helpers for Windows hook parity) alongside the event scripts.
+/// No-op when the source bundle doesn't ship it.
 fn copy_support_hook_scripts(source_dir: &Path, dest_root: &Path) -> Result<()> {
     let Some(source_hooks_root) = source_dir.parent() else {
         return Ok(());
@@ -1223,7 +1245,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{} missing agent", path.display()))
             + agent_marker.len();
         let agent = rest[agent_start..]
-            .split(['"', '\'', ' ', '\n', '\r'])
+            .split(['"', '\'', ' ', '\n', '\r', '$'])
             .next()
             .unwrap_or_else(|| panic!("{} missing agent value", path.display()))
             .to_string();
@@ -1253,6 +1275,61 @@ mod tests {
             .next()
             .unwrap_or_else(|| panic!("{} missing {name} value", path.display()))
             .to_string()
+    }
+
+    // ----------------------------------------------------------------
+    // Shared `_lib.sh` staging
+    // ----------------------------------------------------------------
+
+    /// `stage_hook_scripts` copies the parent dir's `_lib.sh` alongside
+    /// the agent's event scripts so the runtime layout doesn't depend
+    /// on the source-tree shape. This is the only piece of evidence we
+    /// have that the marker-file walk-up helper actually ships — the
+    /// scripts themselves source it with `. "$(dirname "$0")/_lib.sh"`
+    /// and a missing helper would surface as a runtime "command not
+    /// found" much further from the cause.
+    #[test]
+    fn stage_hook_scripts_copies_shared_lib_sh() {
+        // Distinct agent_label per test: `stage_hook_scripts` writes
+        // under `dirs::data_local_dir()/.../hooks/<agent_label>` and
+        // the test binary runs cases in parallel, so two tests using
+        // the same label race on the same staging dir.
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("hooks");
+        let agent_src = bundle.join("stage-shared-lib");
+        fs::create_dir_all(&agent_src).unwrap();
+        fs::write(bundle.join("_lib.sh"), "# shared helper\n").unwrap();
+        stub_scripts(&agent_src, &["session-start.sh", "post-tool-use.sh"]);
+
+        let staged = stage_hook_scripts(&agent_src, "stage-shared-lib").unwrap();
+        assert!(staged.join("session-start.sh").exists());
+        assert!(staged.join("post-tool-use.sh").exists());
+        assert!(
+            staged.join("_lib.sh").exists(),
+            "_lib.sh must be staged alongside event scripts",
+        );
+
+        let lib = fs::read_to_string(staged.join("_lib.sh")).unwrap();
+        assert!(
+            lib.contains("shared helper"),
+            "staged _lib.sh must match the source-of-truth"
+        );
+    }
+
+    /// Skipping `_lib.sh` is fine — older source bundles without the
+    /// marker-walk-up feature should still install cleanly.
+    #[test]
+    fn stage_hook_scripts_tolerates_missing_lib_sh() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("hooks");
+        let agent_src = bundle.join("stage-no-lib");
+        fs::create_dir_all(&agent_src).unwrap();
+        // Note: no _lib.sh in `bundle`.
+        stub_scripts(&agent_src, &["session-start.sh"]);
+
+        let staged = stage_hook_scripts(&agent_src, "stage-no-lib").unwrap();
+        assert!(staged.join("session-start.sh").exists());
+        assert!(!staged.join("_lib.sh").exists());
     }
 
     // ----------------------------------------------------------------
