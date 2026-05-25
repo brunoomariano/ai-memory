@@ -142,6 +142,7 @@ alternatives:
 | anthropic | `claude-haiku-4-5` | ~$0.02 | **Recommended default.** Best balance of speed, restraint, and classification quality. Not a reasoning model. |
 | openai-compat (OpenRouter) | `moonshotai/kimi-k2.6` | ~$0.013 | Reasoning model; latency ~2-3 min per consolidation. Fine because consolidation is fire-and-forget. |
 | openai | `gpt-5.4-mini` | ~$0.002 | Cheaper, faster alternative. Decent quality. |
+| gemini | `gemini-2.5-flash` | free tier covers personal use | Google hosted, native `responseSchema` structured output. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | openai-compat (Ollama) | `qwen3:32b` | $0 | Self-hosted. Set `AI_MEMORY_LLM_BASE_URL=http://host.docker.internal:11434/v1`. Quality depends on the model. |
 
 > **What we don't recommend:** reasoning-mode models (Kimi-K2.6 in reasoning mode,

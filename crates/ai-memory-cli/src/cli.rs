@@ -407,6 +407,8 @@ pub enum LlmProviderChoice {
     Anthropic,
     /// OpenAI Chat Completions.
     Openai,
+    /// Google Gemini (Generative Language API).
+    Gemini,
     /// OpenAI-compatible local (Ollama, vLLM, LM Studio).
     OpenaiCompat,
 }

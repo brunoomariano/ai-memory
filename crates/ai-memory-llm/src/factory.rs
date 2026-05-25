@@ -8,19 +8,22 @@ use std::sync::Arc;
 use secrecy::SecretString;
 
 use crate::AnthropicProvider;
+use crate::GeminiProvider;
 use crate::OpenAiCompatProvider;
 use crate::OpenAiProvider;
 use crate::embedding::{Embedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 
-/// Three providers ship in v1.
+/// Four providers ship in v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderChoice {
     /// Anthropic Messages API.
     Anthropic,
     /// OpenAI Chat Completions.
     OpenAi,
+    /// Google Gemini (Generative Language API).
+    Gemini,
     /// OpenAI-compatible (Ollama / vLLM / LM Studio).
     OpenAiCompat,
 }
@@ -131,6 +134,12 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                 .api_key
                 .ok_or_else(|| LlmError::NotConfigured("OPENAI_API_KEY".into()))?;
             Ok(Arc::new(OpenAiProvider::new(key, config.model)?))
+        }
+        ProviderChoice::Gemini => {
+            let key = config
+                .api_key
+                .ok_or_else(|| LlmError::NotConfigured("GEMINI_API_KEY".into()))?;
+            Ok(Arc::new(GeminiProvider::new(key, config.model)?))
         }
         ProviderChoice::OpenAiCompat => {
             let base = config

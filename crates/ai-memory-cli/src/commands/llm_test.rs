@@ -52,6 +52,7 @@ impl From<LlmProviderChoice> for ProviderChoice {
         match value {
             LlmProviderChoice::Anthropic => Self::Anthropic,
             LlmProviderChoice::Openai => Self::OpenAi,
+            LlmProviderChoice::Gemini => Self::Gemini,
             LlmProviderChoice::OpenaiCompat => Self::OpenAiCompat,
         }
     }

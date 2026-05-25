@@ -1,6 +1,6 @@
 //! LLM provider abstraction for ai-memory.
 //!
-//! Three providers ship in v1, each with a *native, typed*
+//! Four providers ship in v1, each with a *native, typed*
 //! `reqwest`-based client — never a generic gateway. The cognee
 //! issue tracker showed that LiteLLM + Instructor silently drop
 //! unknown kwargs, which makes the wrapper layer drift away from
@@ -8,12 +8,15 @@
 //! Our clients deserialise into named structs that `serde` rejects
 //! on unknown fields, surfacing breakage immediately.
 //!
-//! Three structured-output strategies:
+//! Four structured-output strategies:
 //!
 //! * **Anthropic**: `tools[0]` is set to a single tool whose input
 //!   schema we want filled, with `tool_choice = "tool"`. The
 //!   model's `tool_use` content block is the structured payload.
 //! * **OpenAI**: `response_format = { type: "json_schema", strict: true }`.
+//! * **Gemini**: `generationConfig.responseMimeType = "application/json"`
+//!   plus `responseSchema` (OpenAPI 3 subset; `$ref`s inlined,
+//!   Draft-2020-12 keywords stripped before send).
 //! * **OpenAI-compat** (Ollama, vLLM, LM Studio): we ask for
 //!   `response_format: { type: "json_object" }` when supported,
 //!   otherwise parse the first balanced `{…}` from the text body.
@@ -23,6 +26,7 @@ pub mod anthropic;
 pub mod embedding;
 pub mod error;
 pub mod factory;
+pub mod gemini;
 pub mod openai;
 pub mod openai_compat;
 pub mod provider;
@@ -37,6 +41,7 @@ pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
     default_embedding_dim,
 };
+pub use gemini::GeminiProvider;
 pub use openai::OpenAiProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use provider::{LlmProvider, complete_structured};

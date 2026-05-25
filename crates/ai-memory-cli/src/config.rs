@@ -52,7 +52,7 @@ pub struct Config {
     pub server_url: String,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
     pub log_level: String,
-    /// Optional LLM provider (`anthropic`, `openai`, `openai-compat`).
+    /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`).
     pub llm_provider: Option<String>,
     /// Optional LLM model override.
     pub llm_model: Option<String>,
@@ -110,6 +110,7 @@ pub struct RuntimeEnv {
     host_cwd: Option<String>,
     anthropic_api_key: Option<SecretString>,
     openai_api_key: Option<SecretString>,
+    gemini_api_key: Option<SecretString>,
     llm_api_key: Option<SecretString>,
     llm_base_url: Option<String>,
     voyage_api_key: Option<SecretString>,
@@ -124,6 +125,9 @@ impl RuntimeEnv {
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
             anthropic_api_key: env_secret("ANTHROPIC_API_KEY"),
             openai_api_key: env_secret("OPENAI_API_KEY"),
+            // GOOGLE_API_KEY is the older alias many Google docs still
+            // mention; accept either so users don't get tripped up.
+            gemini_api_key: env_secret("GEMINI_API_KEY").or_else(|| env_secret("GOOGLE_API_KEY")),
             llm_api_key: env_secret("LLM_API_KEY"),
             llm_base_url: env_string("LLM_BASE_URL"),
             voyage_api_key: env_secret("VOYAGE_API_KEY"),
@@ -298,10 +302,12 @@ impl Config {
         let provider = match provider_raw {
             "anthropic" => ProviderChoice::Anthropic,
             "openai" => ProviderChoice::OpenAi,
+            "gemini" | "google" => ProviderChoice::Gemini,
             "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
             other => {
                 return Err(LlmError::NotConfigured(format!(
-                    "AI_MEMORY_LLM_PROVIDER={other} is not one of anthropic|openai|openai-compat"
+                    "AI_MEMORY_LLM_PROVIDER={other} is not one of \
+                     anthropic|openai|gemini|openai-compat"
                 )));
             }
         };
@@ -310,6 +316,7 @@ impl Config {
             None => match provider {
                 ProviderChoice::Anthropic => "claude-sonnet-4-6".to_string(),
                 ProviderChoice::OpenAi => "gpt-4o-mini".to_string(),
+                ProviderChoice::Gemini => "gemini-2.5-flash".to_string(),
                 ProviderChoice::OpenAiCompat => {
                     return Err(LlmError::NotConfigured(
                         "AI_MEMORY_LLM_MODEL must be set explicitly for openai-compat \
@@ -382,6 +389,7 @@ impl Config {
         match provider {
             ProviderChoice::Anthropic => self.runtime_env.anthropic_api_key.clone(),
             ProviderChoice::OpenAi => self.runtime_env.openai_api_key.clone(),
+            ProviderChoice::Gemini => self.runtime_env.gemini_api_key.clone(),
             ProviderChoice::OpenAiCompat => self.runtime_env.llm_api_key.clone(),
         }
     }
