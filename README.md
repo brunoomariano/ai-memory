@@ -595,7 +595,25 @@ AI_MEMORY_LLM_MODEL=openai/gpt-5.4-mini
 LLM_API_KEY=sk-or-v1-…
 ```
 
-### Option 3 - Local Ollama qwen3:32b *(free / self-hosted)*
+### Option 3 - Google Gemini 2.5 Flash *(generous free tier)*
+
+Hosted by Google, with a free tier that's enough for most
+personal consolidation loads. Structured-output is native
+(`responseSchema` over OpenAPI 3 subset); the client inlines
+`$ref`s and strips Draft-2020-12 keywords Gemini rejects, so
+schemars-derived schemas just work. Use `gemini-2.5-flash`
+for the speed/cost balance; avoid the *-thinking* variants
+(see "What we don't recommend" below).
+
+Grab a key from https://aistudio.google.com/apikey, then:
+
+```bash
+AI_MEMORY_LLM_PROVIDER=gemini
+AI_MEMORY_LLM_MODEL=gemini-2.5-flash      # optional; this is the default
+GEMINI_API_KEY=AIza…                      # GOOGLE_API_KEY also accepted
+```
+
+### Option 4 - Local Ollama qwen3:32b *(free / self-hosted)*
 
 $0 per consolidation. Requires a machine with at least ~24 GB
 of unified or VRAM memory to keep the Q4_K_M weights warm
