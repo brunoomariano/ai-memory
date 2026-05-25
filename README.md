@@ -14,6 +14,25 @@
 [![Rust](https://img.shields.io/badge/rust-1.95+-blue)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
+## Support Matrix
+
+| Area | Status | Notes |
+|---|---|---|
+| Linux | Supported | Primary Docker/server target and CI platform. |
+| macOS | Supported | Workspace tests run in CI; native source builds are supported. |
+| Windows via WSL2 | Supported | Use the Linux install path inside WSL2 when the agent runs there. |
+| Native Windows | Experimental | PowerShell wrapper and `.ps1` hooks are available; real agent harness feedback still needed. See [`docs/windows.md`](docs/windows.md). |
+| Claude Code | Supported | MCP config + lifecycle hooks. |
+| Codex | Supported | MCP config + lifecycle hooks. |
+| OpenCode | Supported | Remote MCP config + generated TypeScript plugin. |
+| Cursor | Supported | MCP config + lifecycle hooks. |
+| Gemini CLI | Supported | MCP config + lifecycle hooks. |
+| Oh My Pi / OMP | Supported | `pi` / `omp` aliases for MCP config + TypeScript extension. |
+| Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
+| OpenClaw | MCP-only | OpenClaw has MCP/webhook ingress but no lifecycle hook surface. |
+| LLM providers | Supported | Anthropic, OpenAI, and OpenAI-compatible endpoints. |
+| Embedding providers | Supported | OpenAI and Voyage. |
+
 ## What it is
 
 LLM coding agents lose all context when a session ends. ai-memory

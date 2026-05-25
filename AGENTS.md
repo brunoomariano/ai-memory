@@ -57,3 +57,9 @@ Both are idempotent: re-runs replace the block bracketed by
 `<!-- ai-memory:start -->` / `<!-- ai-memory:end -->` markers
 without disturbing the rest of the file.
 <!-- ai-memory:end -->
+
+## Project Maintenance Rules
+
+- When a change affects user-visible behavior, installation, supported
+  platforms, supported agents, providers, or deployment, update
+  `CHANGELOG.md` and the README/docs support references in the same commit.

@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `--client omp` write native `~/.omp/agent/mcp.json` config, while
   `install-hooks --agent omp` and `--agent pi` write the TypeScript extension
   used for lifecycle capture and handoff injection.
+- Graph-aware retrieval: `memory_query` now combines FTS5, wikilink-neighbor
+  expansion, optional vector RRF, and bounded raw-observation fallback.
+- Observation FTS indexing and unresolved-link diagnostics surfaced through
+  admin/CLI status paths.
+- `_slots/` wiki pages are automatically pinned and surfaced in briefing /
+  explore snapshots.
+- Server-side scheduled maintenance for forget sweep and lint, with optional
+  embedding backfill scheduling.
+- Experimental native Windows support: PowerShell Docker wrapper,
+  `ai-memory.cmd`, `.ps1` lifecycle hooks in parity with `.sh` hooks, Windows
+  Tailwind hash/download support, and [`docs/windows.md`](docs/windows.md).
+- README support matrix for operating systems, agent integrations, LLM
+  providers, and embedding providers.
+
+### Changed
+- Documented the vector backend policy and the measured criteria required
+  before adding `sqlite-vec`.
+- Docker images now bundle both POSIX and PowerShell hook scripts.
+
+### Fixed
+- Hyphenated FTS5 queries such as `ai-memory` are normalized safely instead of
+  being parsed as column operators.
 
 ## [0.1.3] - 2026-05-24
 
