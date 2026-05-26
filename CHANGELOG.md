@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Filesystem watcher now reindexes a project when backends report only a
   parent-directory event, improving external editor capture on macOS/FSEvents.
+- OpenAI strict structured-output schema normalization now strips generated
+  `$ref` annotation siblings and rewrites generated enum `oneOf` schemas to
+  `anyOf`, unblocking `memory_consolidate multi_page=true` on OpenAI models.
 
 ## [0.2.0] - 2026-05-26
 ### Added

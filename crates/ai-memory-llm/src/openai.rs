@@ -346,29 +346,24 @@ impl OpenAiProvider {
 fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
-            // OpenAI's structured-output validator rejects any sibling
-            // keyword next to `$ref` with a 400 (per JSON Schema 2020-12
-            // §8.2.3.1, $ref siblings are ignored during validation —
-            // OpenAI hardens that into a hard error). schemars 1.x emits
-            // a field-level `description` next to `$ref` for every
-            // doc-commented field typed as an external enum (e.g.
-            // `tier: Tier` on `ConsolidatedPageUpdate`); without this
-            // strip, `memory_consolidate multi_page=true` 400s on every
-            // call. Dropping the siblings is semantically a no-op —
-            // only the documentation-only annotation is lost; the
-            // type's own description on the referenced `$defs` entry
-            // is what reaches the model.
+            // OpenAI's structured-output subset rejects any sibling
+            // keyword next to `$ref` with a 400. schemars 1.x emits a
+            // field-level `description` next to `$ref` for doc-commented
+            // fields typed as external enums (e.g. `tier: Tier` on
+            // `ConsolidatedPageUpdate`); without this strip,
+            // `memory_consolidate multi_page=true` fails before the model
+            // runs. In our generated schemas those siblings are
+            // annotations, not validation constraints, so the referenced
+            // definition remains the source of truth.
             if map.contains_key("$ref") {
                 map.retain(|k, _| k == "$ref");
                 return;
             }
             // OpenAI strict mode rejects `oneOf` outright but accepts
-            // `anyOf`. schemars 1.x emits `oneOf` for every Rust enum
-            // with tagged variants (closed sets where exactly one
-            // branch matches), e.g. `Tier` and `PageKind` under `$defs`
-            // in `ConsolidatedBatch`. For non-overlapping branches the
-            // rewrite is semantically lossless and unblocks every
-            // structured-output call that touches an enum.
+            // `anyOf`. schemars 1.x emits `oneOf` for closed Rust enums
+            // such as `Tier` and `PageKind` under `$defs` in
+            // `ConsolidatedBatch`; their const branches are disjoint, so
+            // the rewrite preserves the generated schema's accepted set.
             if let Some(one_of) = map.remove("oneOf") {
                 map.insert("anyOf".to_string(), one_of);
             }
@@ -466,7 +461,9 @@ mod tests {
         model_requires_max_completion_tokens, normalize_openai_base,
     };
     use crate::types::{ChatMessage, ChatRequest, Role};
+    use schemars::JsonSchema;
     use secrecy::SecretString;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
 
     fn provider_for(model: &str) -> OpenAiProvider {
@@ -574,11 +571,8 @@ mod tests {
         // doc-commented field is typed as an external enum (e.g.
         // `tier: Tier` in `ConsolidatedPageUpdate`). Without this
         // strip, `memory_consolidate multi_page=true` 400s on every
-        // call against gpt-4o-mini. JSON Schema 2020-12 §8.2.3.1 says
-        // siblings of `$ref` are ignored during validation, so
-        // dropping them is semantically a no-op — only the
-        // documentation-only field-level description is lost (the
-        // type's own description on the referenced definition stays).
+        // call against gpt-4o-mini. In our generated schemas those
+        // siblings are annotations, not validation constraints.
         let mut schema = json!({
             "type": "object",
             "properties": {
@@ -635,10 +629,36 @@ mod tests {
     }
 
     #[test]
+    fn enforce_strict_normalizes_schemars_enum_refs() {
+        #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+        struct Fixture {
+            /// Doc-commented enum field, matching the schemars shape that
+            /// triggered OpenAI's `$ref` sibling rejection.
+            tier: FixtureTier,
+            /// Array of the same enum, covering `$ref` under `items`.
+            tiers: Vec<FixtureTier>,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+        #[serde(rename_all = "snake_case")]
+        enum FixtureTier {
+            Working,
+            Episodic,
+        }
+
+        let mut schema = serde_json::to_value(schemars::schema_for!(Fixture)).unwrap();
+        enforce_strict_object_schemas(&mut schema);
+
+        assert_no_one_of(&schema);
+        assert_no_ref_siblings(&schema);
+        assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
     fn enforce_strict_strips_ref_siblings_inside_array_items() {
-        // The same JSON-Schema-2020-12 rule applies anywhere $ref
-        // appears, not just on direct object properties — schemars
-        // emits it inside `items` for `Vec<EnumType>` too.
+        // OpenAI applies the same `$ref` sibling restriction anywhere a
+        // ref appears, not just on direct object properties. schemars
+        // emits this shape inside `items` for `Vec<EnumType>` too.
         let mut schema = json!({
             "type": "array",
             "items": {
@@ -650,6 +670,42 @@ mod tests {
         let items = &schema["items"];
         assert_eq!(items["$ref"], json!("#/$defs/Tier"));
         assert!(items.get("description").is_none());
+    }
+
+    fn assert_no_one_of(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                assert!(map.get("oneOf").is_none(), "oneOf remains in {value}");
+                for child in map.values() {
+                    assert_no_one_of(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    assert_no_one_of(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_no_ref_siblings(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.contains_key("$ref") {
+                    assert_eq!(map.len(), 1, "$ref has siblings in {value}");
+                }
+                for child in map.values() {
+                    assert_no_ref_siblings(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    assert_no_ref_siblings(child);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[test]
