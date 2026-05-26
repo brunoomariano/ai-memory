@@ -694,4 +694,88 @@ mod tests {
             .unwrap();
         assert!(none.is_none());
     }
+
+    #[tokio::test]
+    async fn delete_stale_page_embeddings_removes_mismatched_rows() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "test", None)
+            .await
+            .unwrap();
+        let p1 = store
+            .writer
+            .upsert_page(sample_page(ws, proj, "a.md", "body a"))
+            .await
+            .unwrap();
+        let p2 = store
+            .writer
+            .upsert_page(sample_page(ws, proj, "b.md", "body b"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .store_embedding(
+                p1,
+                vec![0u8; 4],
+                "google".into(),
+                "models/gemini-embedding-001".into(),
+                768,
+            )
+            .await
+            .unwrap();
+        store
+            .writer
+            .store_embedding(
+                p2,
+                vec![1u8; 4],
+                "openai".into(),
+                "openai/text-embedding-3-small".into(),
+                1536,
+            )
+            .await
+            .unwrap();
+        let n = store
+            .writer
+            .delete_stale_page_embeddings(
+                "openai".into(),
+                "openai/text-embedding-3-small".into(),
+                1536,
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let mismatch = store
+            .reader
+            .embedding_meta_for_mismatch(
+                "openai".into(),
+                "openai/text-embedding-3-small".into(),
+                1536,
+            )
+            .await
+            .unwrap();
+        assert!(mismatch.is_empty());
+    }
+
+    #[test]
+    fn v07_migration_metadata_for_fork_repair() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("repair-meta.db");
+        let mut conn = Connection::open(&db_path).unwrap();
+        crate::migrations::run_to(&mut conn, 7).unwrap();
+        let (name, checksum): (String, String) = conn
+            .query_row(
+                "SELECT name, checksum FROM refinery_schema_history WHERE version = 7",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        eprintln!("V7_NAME={name} V7_CHECKSUM={checksum}");
+    }
 }

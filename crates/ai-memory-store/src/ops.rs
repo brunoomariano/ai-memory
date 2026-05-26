@@ -822,6 +822,28 @@ pub fn purge_project(
     })
 }
 
+/// Remove embedding rows for latest pages whose `(provider, model, dim)`
+/// does not match the configured triple (used before a full re-embed).
+pub fn delete_stale_page_embeddings(
+    conn: &mut Connection,
+    provider: &str,
+    model: &str,
+    dim: u32,
+) -> StoreResult<u64> {
+    let n = conn.execute(
+        "DELETE FROM page_embeddings \
+         WHERE page_id IN (SELECT id FROM pages WHERE is_latest = 1) \
+           AND NOT (provider = ?1 AND model = ?2 AND dim = CAST(?3 AS INTEGER))",
+        params![provider, model, dim],
+    )?;
+    let orphans = conn.execute(
+        "DELETE FROM page_embeddings \
+         WHERE page_id IN (SELECT id FROM pages WHERE is_latest = 0)",
+        [],
+    )?;
+    Ok(u64::try_from(n.saturating_add(orphans)).unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
     //! Focused unit tests for the load-bearing mutating SQL paths.
@@ -1227,5 +1249,50 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM page_embeddings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn delete_stale_page_embeddings_removes_mismatched_rows() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let p1 = upsert_page(&mut conn, &page(ws, proj, "a.md", "body a")).unwrap();
+        let p2 = upsert_page(&mut conn, &page(ws, proj, "b.md", "body b")).unwrap();
+        store_embedding(
+            &mut conn,
+            &p1,
+            &[0u8; 4],
+            "google",
+            "models/gemini-embedding-001",
+            768,
+        )
+        .unwrap();
+        store_embedding(
+            &mut conn,
+            &p2,
+            &[1u8; 4],
+            "openai",
+            "openai/text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+        let n = super::delete_stale_page_embeddings(
+            &mut conn,
+            "openai",
+            "openai/text-embedding-3-small",
+            1536,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM page_embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
+        let model: String = conn
+            .query_row(
+                "SELECT model FROM page_embeddings WHERE page_id = ?1",
+                params![&p2.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, "openai/text-embedding-3-small");
     }
 }

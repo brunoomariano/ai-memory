@@ -875,10 +875,11 @@ impl ReaderPool {
     ) -> StoreResult<Vec<(String, String, u32, u64)>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT provider, model, dim, COUNT(*) \
-                 FROM page_embeddings \
-                 WHERE NOT (provider = ?1 AND model = ?2 AND dim = ?3) \
-                 GROUP BY provider, model, dim",
+                "SELECT pe.provider, pe.model, pe.dim, COUNT(*) \
+                 FROM page_embeddings pe \
+                 JOIN pages pg ON pg.id = pe.page_id AND pg.is_latest = 1 \
+                 WHERE NOT (pe.provider = ?1 AND pe.model = ?2 AND pe.dim = ?3) \
+                 GROUP BY pe.provider, pe.model, pe.dim",
             )?;
             let rows = stmt.query_map(params![provider, model, dim], |row| {
                 let provider: String = row.get(0)?;

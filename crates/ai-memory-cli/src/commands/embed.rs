@@ -14,6 +14,7 @@ struct EmbedRequest {
     project: String,
     reembed: bool,
     dry_run: bool,
+    all_projects: bool,
 }
 
 /// Run the `embed` subcommand.
@@ -27,7 +28,15 @@ struct EmbedRequest {
 /// response.
 pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
     let endpoint = ServerEndpoint::from_config(config);
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    // Model migrations must reach stale rows in every project namespace.
+    // Without an explicit `--project`, `--force` / `--reembed` fans out
+    // across the whole workspace instead of the CWD-derived project only.
+    let all_projects = args.force && args.project.is_none();
+    let project = if all_projects {
+        String::new()
+    } else {
+        super::resolve_project_name(config, args.project.as_deref())?
+    };
     let report: serde_json::Value = post_json(
         &endpoint,
         "/admin/embed",
@@ -38,6 +47,7 @@ pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
             // field is `reembed` — map them here.
             reembed: args.force,
             dry_run: args.dry_run,
+            all_projects,
         },
     )
     .await?;
@@ -50,4 +60,39 @@ pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn force_without_project_enables_all_projects() {
+        let cli = Cli::try_parse_from(["ai-memory", "embed", "--force"]).unwrap();
+        let Command::Embed(args) = cli.command else {
+            panic!("expected embed command");
+        };
+        assert!(args.force);
+        assert!(args.project.is_none());
+        assert!(
+            args.force && args.project.is_none(),
+            "--force without --project must fan out to all projects"
+        );
+    }
+
+    #[test]
+    fn force_with_explicit_project_stays_scoped() {
+        let cli =
+            Cli::try_parse_from(["ai-memory", "embed", "--force", "--project", "consisanet"])
+                .unwrap();
+        let Command::Embed(args) = cli.command else {
+            panic!("expected embed command");
+        };
+        let all_projects = args.force && args.project.is_none();
+        assert!(
+            !all_projects,
+            "--force with --project must stay scoped to that project"
+        );
+    }
 }

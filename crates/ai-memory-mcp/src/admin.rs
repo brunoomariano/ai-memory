@@ -899,7 +899,8 @@ struct EmbedRequest {
     /// Workspace name (auto-created if absent).
     #[serde(default = "default_workspace")]
     workspace: String,
-    /// Project name (auto-created if absent).
+    /// Project name (auto-created if absent). Ignored when
+    /// [`Self::all_projects`] is true.
     #[serde(default = "default_project")]
     project: String,
     /// When true, regenerates embeddings even for pages that already
@@ -910,6 +911,12 @@ struct EmbedRequest {
     /// calling the embedder or writing anything.
     #[serde(default)]
     dry_run: bool,
+    /// When true, embed every project in `workspace` instead of a
+    /// single `project`. The CLI sets this for `--force` /
+    /// `--reembed` without an explicit `--project` so model migrations
+    /// reach stale rows in every namespace.
+    #[serde(default)]
+    all_projects: bool,
 }
 
 /// Summary response from `POST /admin/embed`.
@@ -932,6 +939,134 @@ pub struct EmbedReport {
     pub dim: u32,
 }
 
+#[derive(Default)]
+struct EmbedCounts {
+    embedded: usize,
+    skipped: usize,
+    failed: usize,
+    would_embed: usize,
+}
+
+impl EmbedCounts {
+    fn absorb(&mut self, other: Self) {
+        self.embedded += other.embedded;
+        self.skipped += other.skipped;
+        self.failed += other.failed;
+        self.would_embed += other.would_embed;
+    }
+}
+
+async fn embed_project_pages(
+    state: &AdminState,
+    embedder: &Arc<dyn Embedder>,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    reembed: bool,
+    dry_run: bool,
+) -> Result<EmbedCounts, (StatusCode, Json<serde_json::Value>)> {
+    let provider = embedder.provider().to_string();
+    let model = embedder.model().to_string();
+    let dim = embedder.dim();
+
+    if reembed && !dry_run {
+        let purged = state
+            .writer
+            .delete_stale_page_embeddings(provider.clone(), model.clone(), dim)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        if purged > 0 {
+            info!(
+                purged,
+                provider = %provider,
+                model = %model,
+                dim,
+                "embed: purged stale page_embeddings before re-embed"
+            );
+        }
+    }
+
+    let candidates = state
+        .reader
+        .decay_candidates(ws, proj)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+
+    let already: std::collections::HashSet<_> = if reembed {
+        std::collections::HashSet::new()
+    } else {
+        state
+            .reader
+            .embedded_page_ids(ws, proj, provider.clone(), model.clone(), dim)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?
+            .into_iter()
+            .collect()
+    };
+
+    let mut counts = EmbedCounts::default();
+    let mut pending = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
+
+    for cand in candidates {
+        if !reembed && already.contains(&cand.id) {
+            counts.skipped += 1;
+            continue;
+        }
+        if dry_run {
+            counts.would_embed += 1;
+            continue;
+        }
+        let md = match state.wiki.read_page(ws, proj, &cand.path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(path = %cand.path, error = %e, "embed: skip unreadable page");
+                counts.failed += 1;
+                continue;
+            }
+        };
+        if md.body.trim().is_empty() {
+            counts.skipped += 1;
+            continue;
+        }
+        let vec = match embedder.embed_document(&md.body).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(path = %cand.path, error = %e, "embed: provider call failed");
+                counts.failed += 1;
+                continue;
+            }
+        };
+        // Gentle pacing for provider rate limits (OpenRouter free tier, etc.).
+        if !dry_run {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
+        pending.push(EmbeddingWrite {
+            page_id: cand.id,
+            vector_bytes: f32_vec_to_bytes(&vec),
+            provider: provider.clone(),
+            model: model.clone(),
+            dim,
+        });
+        if pending.len() >= EMBEDDING_WRITE_BATCH {
+            flush_embedding_batch(
+                &state.writer,
+                &mut pending,
+                &mut counts.embedded,
+                &mut counts.failed,
+            )
+            .await;
+        }
+    }
+    flush_embedding_batch(
+        &state.writer,
+        &mut pending,
+        &mut counts.embedded,
+        &mut counts.failed,
+    )
+    .await;
+
+    Ok(counts)
+}
+
 async fn handle_embed(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<EmbedRequest>,
@@ -952,76 +1087,58 @@ async fn handle_embed(
     let model = embedder.model().to_string();
     let dim = embedder.dim();
 
-    let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
+    let mut totals = EmbedCounts::default();
 
-    let candidates = state
-        .reader
-        .decay_candidates(ws, proj)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
-
-    // Build the set of page ids that already have a matching embedding.
-    let already: std::collections::HashSet<_> = if req.reembed {
-        std::collections::HashSet::new()
-    } else {
-        state
-            .reader
-            .embedded_page_ids(ws, proj, provider.clone(), model.clone(), dim)
+    if req.reembed && !req.dry_run {
+        let purged = state
+            .writer
+            .delete_stale_page_embeddings(provider.clone(), model.clone(), dim)
             .await
-            .map_err(|e| internal_err(e.to_string()))?
-            .into_iter()
-            .collect()
-    };
-
-    let mut embedded = 0_usize;
-    let mut skipped = 0_usize;
-    let mut failed = 0_usize;
-    let mut would_embed = 0_usize;
-    let mut pending = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
-
-    for cand in candidates {
-        if !req.reembed && already.contains(&cand.id) {
-            skipped += 1;
-            continue;
-        }
-        if req.dry_run {
-            would_embed += 1;
-            continue;
-        }
-        let md = match state.wiki.read_page(ws, proj, &cand.path) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(path = %cand.path, error = %e, "embed: skip unreadable page");
-                failed += 1;
-                continue;
-            }
-        };
-        let vec = match embedder.embed_document(&md.body).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(path = %cand.path, error = %e, "embed: provider call failed");
-                failed += 1;
-                continue;
-            }
-        };
-        pending.push(EmbeddingWrite {
-            page_id: cand.id,
-            vector_bytes: f32_vec_to_bytes(&vec),
-            provider: provider.clone(),
-            model: model.clone(),
-            dim,
-        });
-        if pending.len() >= EMBEDDING_WRITE_BATCH {
-            flush_embedding_batch(&state.writer, &mut pending, &mut embedded, &mut failed).await;
-        }
+            .map_err(|e| internal_err(e.to_string()))?;
+        info!(purged, provider = %provider, model = %model, "purged stale page_embeddings before re-embed");
     }
-    flush_embedding_batch(&state.writer, &mut pending, &mut embedded, &mut failed).await;
+
+    if req.all_projects {
+        let summaries = state
+            .reader
+            .list_projects_with_stats()
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        for summary in summaries
+            .into_iter()
+            .filter(|p| p.workspace_name == req.workspace)
+        {
+            let (ws, proj) =
+                resolve_ws_proj(&state, &summary.workspace_name, &summary.project_name).await?;
+            let partial = embed_project_pages(
+                &state,
+                &embedder,
+                ws,
+                proj,
+                req.reembed,
+                req.dry_run,
+            )
+            .await?;
+            totals.absorb(partial);
+        }
+    } else {
+        let (ws, proj) = resolve_ws_proj(&state, &req.workspace, &req.project).await?;
+        totals = embed_project_pages(
+            &state,
+            &embedder,
+            ws,
+            proj,
+            req.reembed,
+            req.dry_run,
+        )
+        .await?;
+    }
 
     let report = EmbedReport {
-        embedded,
-        skipped,
-        failed,
-        would_embed,
+        embedded: totals.embedded,
+        skipped: totals.skipped,
+        failed: totals.failed,
+        would_embed: totals.would_embed,
         provider,
         model,
         dim,
