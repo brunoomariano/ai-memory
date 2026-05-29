@@ -506,6 +506,7 @@ async fn process(state: &HookState, env: HookEnvelope) -> anyhow::Result<()> {
                 tier: new_page.tier,
                 pinned: new_page.pinned,
                 title: None,
+                admission_ctx: None,
             })
             .await?;
         state.writer.end_session(session_id, Some(page_id)).await?;
@@ -702,6 +703,7 @@ async fn consolidate_or_synth(
             tier: new_page.tier,
             pinned: new_page.pinned,
             title: None,
+            admission_ctx: None,
         })
         .await?;
     let _ = state.wiki.commit_all(&format!(

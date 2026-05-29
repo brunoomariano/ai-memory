@@ -55,6 +55,7 @@ fn wiki_req(
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
     }
 }
 
@@ -1518,6 +1519,7 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
     })
     .await
     .unwrap();
@@ -1596,6 +1598,7 @@ async fn api_page_handler_etag_differs_per_page() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
     })
     .await
     .unwrap();
@@ -1608,6 +1611,7 @@ async fn api_page_handler_etag_differs_per_page() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
     })
     .await
     .unwrap();

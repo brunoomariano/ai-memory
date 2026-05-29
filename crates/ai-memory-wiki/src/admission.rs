@@ -1,0 +1,412 @@
+//! HTTP admission webhook chain — engine's *only* extension point for
+//! enriching/validating pages just before persistence.
+//!
+//! ## Design (OCP)
+//!
+//! The engine ships ONE generic primitive: a chain of HTTP webhooks invoked
+//! synchronously inside [`Wiki::write_page`](crate::Wiki::write_page) AFTER
+//! the [`Markdown`](crate::Markdown) is built but BEFORE [`crate::emit`] +
+//! atomic write. Each webhook receives the page (path + frontmatter + body)
+//! and an [`AdmissionContext`] (actor identity + workspace/project scope),
+//! and may:
+//!
+//! - Return `200 OK` with a mutated `{ page }` → engine substitutes
+//!   `frontmatter` and/or `body` before persistence.
+//! - Return `204 No Content` → no mutation, chain continues.
+//! - Return `4xx/5xx` → behaviour governed by the webhook's
+//!   [`FailurePolicy`] (`Ignore` = log+skip; `Reject` = abort the write).
+//!
+//! Each new domain extension (`contributors`, `cost-tracker`, `git-mirror`,
+//! `review-marker`, …) becomes a NEW external HTTP service — engine never
+//! grows for new fields/behaviours.
+//!
+//! ## Loop prevention
+//!
+//! Callers may set [`AdmissionContext::skip_webhooks`] from the
+//! `X-Memory-Skip-Admission-Chain` request header — that lets a webhook
+//! that calls back into the engine (e.g. to write a derived page) opt out
+//! of being re-invoked on the recursive write.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use ai_memory_core::PagePath;
+use serde::{Deserialize, Serialize};
+
+use crate::error::WikiError;
+use crate::{Markdown, WikiResult};
+
+/// Lifecycle operation that triggered the chain. Webhooks subscribe via
+/// [`WebhookConfig::events`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionOp {
+    /// A `Wiki::write_page` call (most writes — MCP `memory_write_page`,
+    /// CLI `write-page`, admin endpoint).
+    #[default]
+    WritePage,
+    /// An LLM consolidation write (consolidator/lint compile observations
+    /// into a durable page).
+    Consolidate,
+}
+
+impl AdmissionOp {
+    /// String value for the `X-Memory-Op` request header sent to webhooks.
+    #[must_use]
+    pub fn as_header_value(&self) -> &'static str {
+        match self {
+            AdmissionOp::WritePage => "write_page",
+            AdmissionOp::Consolidate => "consolidate",
+        }
+    }
+}
+
+/// What the engine does when a webhook returns 4xx/5xx or fails to respond.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailurePolicy {
+    /// Log a warning and continue with the unmutated page. Safer default —
+    /// page writes never blocked by buggy/down webhooks.
+    #[default]
+    Ignore,
+    /// Abort the write with an error. Use for safety-critical webhooks
+    /// (e.g. a `validate-no-secrets` enforcer).
+    Reject,
+}
+
+fn default_timeout_ms() -> u64 {
+    2_000
+}
+
+/// One webhook entry in the chain. Loaded from operator config
+/// (`[[admission_webhooks]]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    /// Stable identifier (used by loop-prevention skip lists + log fields).
+    pub name: String,
+    /// HTTP endpoint to POST the payload to.
+    pub url: String,
+    /// Per-request timeout in milliseconds. Default 2000.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// What to do on webhook failure. Default [`FailurePolicy::Ignore`].
+    #[serde(default)]
+    pub failure_policy: FailurePolicy,
+    /// Subset of [`AdmissionOp`] this webhook subscribes to. If empty,
+    /// the webhook is effectively disabled (it'll never fire).
+    pub events: Vec<AdmissionOp>,
+}
+
+/// Identity of the actor that triggered a write. Populated by the caller
+/// (MCP tool, admin endpoint, hook router) from validated JWT claims +
+/// injected headers (typically `X-Memory-Actor-*` from `mcp-auth`).
+///
+/// All fields are optional: internal callers (CLI bootstrap, tests) may
+/// leave them blank; webhooks must handle that gracefully.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActorContext {
+    /// `claude-code` | `codex` | `opencode` | `hook` | `cli` | …
+    pub agent: Option<String>,
+    /// Keycloak `preferred_username` (e.g. `djalmajr`).
+    pub user: Option<String>,
+    /// JWT `sub` claim (stable user UUID).
+    pub sub: Option<String>,
+    /// DCR client UUID (identifies the agent install).
+    pub client: Option<String>,
+    /// Session id from the agent (if known).
+    pub session_id: Option<String>,
+}
+
+impl ActorContext {
+    /// `true` if at least one identity field is set. Useful for callers
+    /// that want to skip building an [`AdmissionContext`] entirely when
+    /// the actor is completely anonymous.
+    #[must_use]
+    pub fn has_any(&self) -> bool {
+        self.agent.is_some()
+            || self.user.is_some()
+            || self.sub.is_some()
+            || self.client.is_some()
+            || self.session_id.is_some()
+    }
+}
+
+/// Per-write context passed to each webhook. Cheap to construct
+/// (mostly references at the request layer, owned here for serialisation).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AdmissionContext {
+    /// Workspace name the write belongs to. Resolved automatically by
+    /// [`crate::Wiki::write_page`] from `workspace_id` when the wiki has
+    /// been built with [`crate::Wiki::with_store_reader`]; left empty
+    /// otherwise. Webhooks rely on this to address pages by the same
+    /// human-readable name the engine and UI use, instead of
+    /// re-implementing UUID→name lookup or falling back to a placeholder.
+    #[serde(default)]
+    pub workspace: String,
+    /// Project name the write belongs to. Resolution mirrors `workspace`
+    /// (auto-filled from `project_id` when the wiki has a store reader).
+    #[serde(default)]
+    pub project: String,
+    /// Identity of the actor that triggered the write.
+    pub actor: ActorContext,
+    /// Which lifecycle op fired the chain.
+    pub op: AdmissionOp,
+    /// Names from `X-Memory-Skip-Admission-Chain` (CSV at the request layer);
+    /// matched against [`WebhookConfig::name`] to short-circuit re-entrant writes.
+    #[serde(default, skip_serializing)]
+    pub skip_webhooks: Vec<String>,
+}
+
+/// Wire format sent to each webhook (one POST per webhook per write).
+#[derive(Serialize)]
+struct WebhookRequestBody<'a> {
+    page: WebhookPagePayload<'a>,
+    ctx: &'a AdmissionContext,
+}
+
+#[derive(Serialize)]
+struct WebhookPagePayload<'a> {
+    path: &'a str,
+    frontmatter: &'a serde_json::Value,
+    body: &'a str,
+}
+
+/// Wire format expected back from each webhook on `200 OK`. Both inner
+/// fields are optional: the webhook may mutate only frontmatter, only body,
+/// or both. Anything missing means "leave that field unchanged".
+#[derive(Deserialize, Debug, Default)]
+struct WebhookResponseBody {
+    #[serde(default)]
+    page: Option<WebhookResponsePage>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct WebhookResponsePage {
+    #[serde(default)]
+    frontmatter: Option<serde_json::Value>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// Sanity cap on the number of webhooks per chain. The chain runs
+/// sequentially inside `Wiki::write_page`, so each entry adds
+/// `timeout_ms` to worst-case write latency — beyond this many entries
+/// the operator almost certainly mis-templated the config (e.g. helm
+/// loop) and would be better served by an out-of-band fan-out service.
+pub const MAX_ADMISSION_WEBHOOKS: usize = 16;
+
+/// Maximum bytes read from a single webhook response body. Webhooks
+/// only need to return the mutated `page` envelope; multi-megabyte
+/// responses are pathological (faulty webhook or hostile peer) and
+/// would force the engine to buffer them mid-write. Anything beyond
+/// this is treated as malformed and the response is ignored — same
+/// safety profile as a 4xx under `FailurePolicy::Ignore`.
+pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// The chain. Cloneable (cheap — `Arc<Vec<…>>` + `reqwest::Client`).
+#[derive(Clone, Debug)]
+pub struct AdmissionChain {
+    webhooks: Arc<Vec<WebhookConfig>>,
+    client: reqwest::Client,
+}
+
+impl AdmissionChain {
+    /// Build a chain from operator-provided webhook configs. Constructs a
+    /// shared `reqwest::Client` for connection reuse.
+    ///
+    /// # Errors
+    /// - [`WikiError::Io`] if the HTTP client cannot be built.
+    /// - [`WikiError::Io`] if `webhooks.len()` exceeds
+    ///   [`MAX_ADMISSION_WEBHOOKS`] (see the constant docs).
+    pub fn new(webhooks: Vec<WebhookConfig>) -> WikiResult<Self> {
+        if webhooks.len() > MAX_ADMISSION_WEBHOOKS {
+            return Err(WikiError::Io(std::io::Error::other(format!(
+                "admission chain capped at {MAX_ADMISSION_WEBHOOKS} webhooks, got {}",
+                webhooks.len()
+            ))));
+        }
+        let client = reqwest::Client::builder().build().map_err(|e| {
+            WikiError::Io(std::io::Error::other(format!("admission http client: {e}")))
+        })?;
+        Ok(Self {
+            webhooks: Arc::new(webhooks),
+            client,
+        })
+    }
+
+    /// `true` if no webhooks are configured (caller can skip the round-trip).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.webhooks.is_empty()
+    }
+
+    /// Run the chain against `markdown` (mutating `frontmatter`/`body` in
+    /// place). Webhooks are invoked sequentially in config order; each sees
+    /// the output of the previous one.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] only when a webhook with
+    /// [`FailurePolicy::Reject`] fails — otherwise errors are logged and
+    /// skipped (`FailurePolicy::Ignore`).
+    pub async fn run(
+        &self,
+        page_path: &PagePath,
+        markdown: &mut Markdown,
+        ctx: &AdmissionContext,
+    ) -> WikiResult<()> {
+        for hook in self.webhooks.iter() {
+            // Caller-driven skip list (loop prevention via X-Memory-Skip-Admission-Chain).
+            if ctx.skip_webhooks.iter().any(|n| n == &hook.name) {
+                tracing::debug!(webhook = %hook.name, "admission skip (caller opt-out)");
+                continue;
+            }
+            // Webhook doesn't subscribe to this op.
+            if !hook.events.contains(&ctx.op) {
+                continue;
+            }
+
+            let payload = WebhookRequestBody {
+                page: WebhookPagePayload {
+                    path: page_path.as_str(),
+                    frontmatter: &markdown.frontmatter,
+                    body: &markdown.body,
+                },
+                ctx,
+            };
+
+            let result = self
+                .client
+                .post(&hook.url)
+                .header("X-Memory-Op", ctx.op.as_header_value())
+                .timeout(Duration::from_millis(hook.timeout_ms))
+                .json(&payload)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    if resp.status().as_u16() == 204 {
+                        tracing::debug!(webhook = %hook.name, "admission no-op (204)");
+                        continue;
+                    }
+                    // Bound the response read at MAX_RESPONSE_BYTES — a
+                    // pathological/hostile webhook can't force the engine
+                    // to buffer arbitrary bytes mid-write.
+                    let bytes = match resp.bytes().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(
+                                webhook = %hook.name,
+                                error = %e,
+                                "admission response read failed; treating as no-op",
+                            );
+                            continue;
+                        }
+                    };
+                    if bytes.len() > MAX_RESPONSE_BYTES {
+                        tracing::warn!(
+                            webhook = %hook.name,
+                            bytes = bytes.len(),
+                            cap = MAX_RESPONSE_BYTES,
+                            "admission response exceeds cap; treating as no-op",
+                        );
+                        continue;
+                    }
+                    match serde_json::from_slice::<WebhookResponseBody>(&bytes) {
+                        Ok(parsed) => {
+                            if let Some(page) = parsed.page {
+                                if let Some(new_fm) = page.frontmatter {
+                                    markdown.frontmatter = new_fm;
+                                }
+                                if let Some(new_body) = page.body {
+                                    markdown.body = new_body;
+                                }
+                                tracing::debug!(webhook = %hook.name, "admission mutation applied");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                webhook = %hook.name,
+                                error = %e,
+                                "admission response not JSON; treating as no-op",
+                            );
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body_txt = resp.text().await.unwrap_or_default();
+                    let err_msg = format!(
+                        "admission webhook {} status {}: {}",
+                        hook.name, status, body_txt
+                    );
+                    tracing::warn!(webhook = %hook.name, status = %status, body = %body_txt, "admission error response");
+                    if matches!(hook.failure_policy, FailurePolicy::Reject) {
+                        return Err(WikiError::Io(std::io::Error::other(err_msg)));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(webhook = %hook.name, error = %e, "admission request failed");
+                    if matches!(hook.failure_policy, FailurePolicy::Reject) {
+                        return Err(WikiError::Io(std::io::Error::other(format!(
+                            "admission webhook {} request failed: {}",
+                            hook.name, e
+                        ))));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_safe() {
+        let pol = FailurePolicy::default();
+        assert!(matches!(pol, FailurePolicy::Ignore));
+        let op = AdmissionOp::default();
+        assert!(matches!(op, AdmissionOp::WritePage));
+    }
+
+    #[test]
+    fn webhook_config_deserialises_with_defaults() {
+        // Using JSON keeps the test free of an extra TOML dep — the
+        // serde derives are format-agnostic so the same `#[serde(default)]`
+        // handling exercised here covers TOML/YAML/etc.
+        let json_src = serde_json::json!({
+            "name": "contributors",
+            "url": "http://contributors-webhook/enrich",
+            "events": ["write_page", "consolidate"],
+        });
+        let cfg: WebhookConfig = serde_json::from_value(json_src).expect("parses");
+        assert_eq!(cfg.name, "contributors");
+        assert_eq!(cfg.timeout_ms, 2_000);
+        assert!(matches!(cfg.failure_policy, FailurePolicy::Ignore));
+        assert_eq!(cfg.events.len(), 2);
+    }
+
+    #[test]
+    fn op_header_values() {
+        assert_eq!(AdmissionOp::WritePage.as_header_value(), "write_page");
+        assert_eq!(AdmissionOp::Consolidate.as_header_value(), "consolidate");
+    }
+
+    #[tokio::test]
+    async fn empty_chain_is_noop() {
+        let chain = AdmissionChain::new(vec![]).expect("builds");
+        assert!(chain.is_empty());
+        let mut md = Markdown {
+            frontmatter: serde_json::Value::Null,
+            body: "hello".to_string(),
+        };
+        let path = PagePath::new("foo.md").expect("valid path");
+        let ctx = AdmissionContext::default();
+        chain.run(&path, &mut md, &ctx).await.expect("noop");
+        assert_eq!(md.body, "hello");
+        assert!(md.frontmatter.is_null());
+    }
+}
