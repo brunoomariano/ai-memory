@@ -509,3 +509,100 @@ async fn workspace_and_project_names_propagate_in_payload() {
     assert_eq!(payload["ctx"]["workspace"], json!("default"));
     assert_eq!(payload["ctx"]["project"], json!("ai-memory-ops"));
 }
+
+/// Records `(op-header, page.path)` for each request the webhook receives.
+fn recording_app(seen: Arc<Mutex<Vec<(String, String)>>>) -> Router {
+    Router::new().route(
+        "/hook",
+        post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+            let seen = seen.clone();
+            async move {
+                let op = headers
+                    .get("X-Memory-Op")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let path = payload["page"]["path"].as_str().unwrap_or("").to_string();
+                seen.lock().unwrap().push((op, path));
+                StatusCode::NO_CONTENT
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn notify_delete_sends_op_and_path() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let base = spawn_server(recording_app(seen.clone())).await;
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "mirror".into(),
+        url: format!("{base}/hook"),
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::Delete],
+    }])
+    .unwrap();
+
+    let ctx = AdmissionContext {
+        op: AdmissionOp::Delete,
+        ..AdmissionContext::default()
+    };
+    chain.notify(Some("runbooks/02.md"), &ctx).await.unwrap();
+
+    let rec = seen.lock().unwrap();
+    assert_eq!(rec.len(), 1, "delete must fire one notify");
+    assert_eq!(rec[0].0, "delete");
+    assert_eq!(rec[0].1, "runbooks/02.md");
+}
+
+#[tokio::test]
+async fn notify_purge_has_op_and_no_path() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let base = spawn_server(recording_app(seen.clone())).await;
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "mirror".into(),
+        url: format!("{base}/hook"),
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::PurgeProject],
+    }])
+    .unwrap();
+
+    let ctx = AdmissionContext {
+        op: AdmissionOp::PurgeProject,
+        project: "atlas".into(),
+        ..AdmissionContext::default()
+    };
+    chain.notify(None, &ctx).await.unwrap();
+
+    let rec = seen.lock().unwrap();
+    assert_eq!(rec.len(), 1);
+    assert_eq!(rec[0].0, "purge_project");
+    assert_eq!(rec[0].1, "", "purge carries no page path");
+}
+
+#[tokio::test]
+async fn notify_respects_op_subscription() {
+    // A webhook subscribed only to WritePage must not receive a Delete notify.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let base = spawn_server(recording_app(seen.clone())).await;
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "writes-only".into(),
+        url: format!("{base}/hook"),
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::WritePage],
+    }])
+    .unwrap();
+
+    let ctx = AdmissionContext {
+        op: AdmissionOp::Delete,
+        ..AdmissionContext::default()
+    };
+    chain.notify(Some("x.md"), &ctx).await.unwrap();
+
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "delete must not reach a write-only webhook"
+    );
+}

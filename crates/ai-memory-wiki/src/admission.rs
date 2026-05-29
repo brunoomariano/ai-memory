@@ -48,6 +48,13 @@ pub enum AdmissionOp {
     /// An LLM consolidation write (consolidator/lint compile observations
     /// into a durable page).
     Consolidate,
+    /// A single page is being deleted (`Wiki::delete_page`). Carries the
+    /// page path; no body. Lets a mirror `git rm` the file.
+    Delete,
+    /// A whole project is being purged (`Wiki::purge_project` →
+    /// `remove_dir_all`). Carries the project (ctx), no page path. Lets a
+    /// mirror remove the project's directory.
+    PurgeProject,
 }
 
 impl AdmissionOp {
@@ -57,6 +64,8 @@ impl AdmissionOp {
         match self {
             AdmissionOp::WritePage => "write_page",
             AdmissionOp::Consolidate => "consolidate",
+            AdmissionOp::Delete => "delete",
+            AdmissionOp::PurgeProject => "purge_project",
         }
     }
 }
@@ -347,6 +356,69 @@ impl AdmissionChain {
                 }
                 Err(e) => {
                     tracing::warn!(webhook = %hook.name, error = %e, "admission request failed");
+                    if matches!(hook.failure_policy, FailurePolicy::Reject) {
+                        return Err(WikiError::Io(std::io::Error::other(format!(
+                            "admission webhook {} request failed: {}",
+                            hook.name, e
+                        ))));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Notify webhooks of a delete / purge (`ctx.op` = `Delete` /
+    /// `PurgeProject`). Unlike [`Self::run`], there is no body to send or
+    /// mutate — the webhook acts on `ctx.op` + the (optional) page path, e.g.
+    /// a mirror `git rm`s the file or removes the project directory. Honours
+    /// the same skip-list, op-subscription, timeout, and failure policy.
+    ///
+    /// # Errors
+    /// Returns an error only when a `Reject`-policy webhook fails.
+    pub async fn notify(&self, page_path: Option<&str>, ctx: &AdmissionContext) -> WikiResult<()> {
+        let empty_frontmatter = serde_json::Value::Object(serde_json::Map::new());
+        for hook in self.webhooks.iter() {
+            if ctx.skip_webhooks.iter().any(|n| n == &hook.name) {
+                tracing::debug!(webhook = %hook.name, "admission skip (caller opt-out)");
+                continue;
+            }
+            if !hook.events.contains(&ctx.op) {
+                continue;
+            }
+            let payload = WebhookRequestBody {
+                page: WebhookPagePayload {
+                    path: page_path.unwrap_or(""),
+                    frontmatter: &empty_frontmatter,
+                    body: "",
+                },
+                ctx,
+            };
+            let result = self
+                .client
+                .post(&hook.url)
+                .header("X-Memory-Op", ctx.op.as_header_value())
+                .timeout(Duration::from_millis(hook.timeout_ms))
+                .json(&payload)
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::debug!(webhook = %hook.name, op = ctx.op.as_header_value(), "admission notify ok");
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body_txt = resp.text().await.unwrap_or_default();
+                    tracing::warn!(webhook = %hook.name, status = %status, body = %body_txt, "admission notify error response");
+                    if matches!(hook.failure_policy, FailurePolicy::Reject) {
+                        return Err(WikiError::Io(std::io::Error::other(format!(
+                            "admission webhook {} status {}: {}",
+                            hook.name, status, body_txt
+                        ))));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(webhook = %hook.name, error = %e, "admission notify request failed");
                     if matches!(hook.failure_policy, FailurePolicy::Reject) {
                         return Err(WikiError::Io(std::io::Error::other(format!(
                             "admission webhook {} request failed: {}",

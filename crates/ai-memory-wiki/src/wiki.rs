@@ -7,7 +7,7 @@ use ai_memory_core::{NewPage, PageId, PagePath, ProjectId, Sanitizer, Tier, Work
 use ai_memory_llm::Embedder;
 use ai_memory_store::{ReaderPool, WriterHandle, f32_vec_to_bytes};
 
-use crate::admission::{AdmissionChain, AdmissionContext};
+use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
 use crate::atomic;
 use crate::error::WikiResult;
 use crate::git::GitAdapter;
@@ -196,14 +196,80 @@ impl Wiki {
     ///
     /// # Errors
     /// Returns [`WikiError::Io`] for any OS error other than "not found".
-    pub fn delete_page(
+    /// Best-effort fill of `ctx.workspace`/`ctx.project` from ids via the
+    /// store reader, so webhooks address pages by the same human names the
+    /// engine uses. Mirrors the inline resolution in [`Self::write_page`].
+    async fn resolve_admission_names(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        ctx: &mut AdmissionContext,
+    ) {
+        if let Some(reader) = &self.store_reader {
+            if ctx.workspace.is_empty()
+                && let Ok(Some(name)) = reader.workspace_name_by_id(workspace_id).await
+            {
+                ctx.workspace = name;
+            }
+            if ctx.project.is_empty()
+                && let Ok(Some(name)) = reader.project_name_by_id(workspace_id, project_id).await
+            {
+                ctx.project = name;
+            }
+        }
+    }
+
+    /// Delete a single page file. When an admission chain is attached, it is
+    /// notified (`op=delete`) BEFORE the file is removed, so a mirror can
+    /// `git rm` the same path. A `Reject`-policy webhook aborts the delete.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] on a filesystem error or a rejecting webhook.
+    pub async fn delete_page(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         path: &PagePath,
+        admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<()> {
+        if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::Delete;
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            chain.notify(Some(path.as_str()), &ctx).await?;
+        }
         let abs = self.abs_path(workspace_id, project_id, path);
         match std::fs::remove_file(&abs) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(crate::WikiError::Io(e)),
+        }
+    }
+
+    /// Purge a whole project's wiki directory. When an admission chain is
+    /// attached, it is notified (`op=purge_project`, no page path) BEFORE the
+    /// directory is removed, so a mirror can drop the project. A `Reject`
+    /// webhook aborts the purge. Routes the on-disk removal through the
+    /// namespaced [`Self::project_root`] (invariant: never hand-roll paths).
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] on a filesystem error or a rejecting webhook.
+    pub async fn purge_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<()> {
+        if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::PurgeProject;
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            chain.notify(None, &ctx).await?;
+        }
+        let root = self.project_root(workspace_id, project_id);
+        match std::fs::remove_dir_all(&root) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(crate::WikiError::Io(e)),

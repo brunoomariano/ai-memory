@@ -1375,17 +1375,19 @@ async fn handle_purge_project(
     };
 
     // Remove the entire per-project directory: <wiki_root>/<ws_uuid>/<proj_uuid>/.
-    // DB cascade already deleted all rows; the dir removal is best-effort.
-    let proj_root = state.wiki.project_root(ws_id, proj_id);
-    let proj_root_str = proj_root.display().to_string();
+    // DB cascade already deleted all rows. Routed through Wiki::purge_project so
+    // the admission chain is notified (op=purge_project) before removal — a
+    // mirror can drop its copy of the project. Best-effort dir removal.
+    let proj_root_str = state
+        .wiki
+        .project_root(ws_id, proj_id)
+        .display()
+        .to_string();
     let mut files_deleted: Vec<String> = Vec::new();
     let mut files_failed: Vec<String> = Vec::new();
-    match std::fs::remove_dir_all(&proj_root) {
+    match state.wiki.purge_project(ws_id, proj_id, None).await {
         Ok(()) => {
             files_deleted.push(proj_root_str);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Already absent; nothing to do.
         }
         Err(e) => {
             warn!(path = %proj_root_str, error = %e, "purge-project: failed to remove project dir");

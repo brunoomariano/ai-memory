@@ -1,6 +1,7 @@
 # Admission webhooks: pre-persistence HTTP hooks
 
-> Operator-configured HTTP hooks invoked inside `Wiki::write_page`
+> Operator-configured HTTP hooks invoked on the engine's write path
+> (`Wiki::write_page`, `delete_page`, `purge_project`)
 > just before the page hits disk. Each hook can mutate the
 > page (return a new frontmatter / body) or just observe and side-effect
 > (return `204 No Content`). Sourced from
@@ -39,9 +40,34 @@ Webhooks fire on these `op` values today (extensible enum):
   `write-page`, `/admin/write-page`, the lint rewriter, hook synthesis.
 - `consolidate` — LLM consolidation writes from the consolidator
   (SessionEnd opt-in + PreCompact + manual `memory_consolidate`).
+- `delete` — a single page is removed (`Wiki::delete_page`). Carries the
+  page path, no body; fired **before** the file is removed so a mirror can
+  `git rm` the same path.
+- `purge_project` — a whole project is purged (`Wiki::purge_project` →
+  `remove_dir_all`, routed from `/admin/purge-project`). Carries the
+  project in `ctx`, **no** page path; fired before the directory is
+  removed so a mirror can drop the project.
 
-Each webhook opts into the ops it cares about via `events`. The chain
-checks the op against `WebhookConfig::events` before dispatching.
+`delete` / `purge_project` are notifications — there is no body to mutate;
+a `Reject`-policy webhook still aborts the operation. Each webhook opts
+into the ops it cares about via `events`; the chain checks the op against
+`WebhookConfig::events` before dispatching.
+
+### What does NOT fire the chain (by design)
+
+- **`log.md` / `log-YYYY-MM.md` appends** — written on every hook event
+  (per prompt/tool-call). Routing each through the chain would mean an
+  HTTP POST per observation, violating the fire-and-forget hook budget. The
+  per-event log is a local audit artifact; back it up out-of-band (batched
+  rsync), not per-line.
+- **Handoffs** — SQLite rows, transient cross-agent state, not wiki pages.
+- **Forget-sweep soft/hard-delete** — DB-only (`is_latest=0` / row delete);
+  the markdown file stays on disk, so there is nothing for a file mirror to
+  do. (Only `purge_project` removes files in bulk.)
+- **`rename-project`** — a `projects.name` column update; the on-disk path
+  is the stable UUID, so no file moves and nothing to propagate.
+- **External / manual edits on disk** — reconciled by the watcher, not the
+  admission chain (the chain is for the engine's own write path).
 
 ## 3. Wire contract
 
@@ -50,7 +76,7 @@ checks the op against `WebhookConfig::events` before dispatching.
 ```http
 POST <webhook.url>
 Content-Type: application/json
-X-Memory-Op: write_page | consolidate
+X-Memory-Op: write_page | consolidate | delete | purge_project
 ```
 
 ```jsonc
@@ -70,7 +96,7 @@ X-Memory-Op: write_page | consolidate
       "client": "72836f52-...",              // DCR client UUID
       "session_id": "019e6d-..."
     },
-    "op": "write_page"                       // write_page | consolidate
+    "op": "write_page"                       // write_page | consolidate | delete | purge_project
   }
 }
 ```
