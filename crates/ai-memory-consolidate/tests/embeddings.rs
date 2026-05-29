@@ -65,6 +65,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
             tier: Tier::Semantic,
             pinned: false,
             title: None,
+            admission_ctx: None,
         })
         .await
         .expect("write page");
@@ -182,6 +183,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
     })
     .await
     .expect("rewrite page");

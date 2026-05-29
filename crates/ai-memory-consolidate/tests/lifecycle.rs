@@ -199,6 +199,7 @@ async fn m8_retention_lifecycle_end_to_end() {
                 tier: fx.tier,
                 pinned: false,
                 title: Some(title),
+                admission_ctx: None,
             })
             .await
             .expect("write page");

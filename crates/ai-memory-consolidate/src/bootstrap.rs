@@ -409,6 +409,7 @@ impl Bootstrap {
                 tier: Tier::Semantic,
                 pinned: false,
                 title: Some(page.title.clone()),
+                admission_ctx: None,
             });
         }
         // Plus the manifest itself.
@@ -436,6 +437,7 @@ impl Bootstrap {
             tier: Tier::Semantic,
             pinned: true,
             title: Some("Bootstrap manifest".into()),
+            admission_ctx: None,
         });
 
         let _ids = self.wiki.apply_batch(requests).await?;

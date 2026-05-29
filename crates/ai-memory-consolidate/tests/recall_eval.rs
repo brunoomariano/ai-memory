@@ -133,6 +133,7 @@ async fn recall_at_5_baseline() {
             tier: Tier::Semantic,
             pinned: false,
             title: None,
+            admission_ctx: None,
         })
         .await
         .expect("write page");
@@ -189,6 +190,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
     })
     .await
     .expect("write target");
@@ -201,6 +203,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        admission_ctx: None,
     })
     .await
     .expect("write source");
