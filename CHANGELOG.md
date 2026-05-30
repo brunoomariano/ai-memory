@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Consolidation no longer fails on long sessions** (~5,000+ observations or
+  multi-hour agent runs). Two bugs surfaced trying to consolidate a real
+  16-hour / 7,234-observation session:
+  - **Prompt confusion (regression from the v0.8 `slot_kind` work):** the
+    multi-page consolidator prompt listed `slot_kind` values
+    (`state` / `invariant`) immediately above the `tier` values
+    (`working` / `episodic` / `semantic` / `procedural`). The LLM read them
+    as one list and emitted `tier: "state"` in structured responses, which
+    deserialisation rejected. Prompt now leads with `tier` (with explicit
+    "EXACTLY ONE OF FOUR strings" emphasis), then `kind`, then `slot_kind`
+    under its own clearly-scoped section that states "completely unrelated
+    to tier" and "only for `_slots/*` paths."
+  - **No token budget on the observation dump:** `build_request` and
+    `build_batch_request_with_slots` dumped every observation into the
+    prompt buffer, which exceeded the provider's 200k-token context on long
+    sessions (the sabadell run produced a 235k-token request → 400 from
+    the provider). New `window_observations_to_budget` walks the slice
+    from most-recent backward, keeping each entry whose render cost fits
+    in a 400k-char budget (~100k tokens), leaving room for the system
+    prompt + schema + LLM output. When entries are skipped, a prepended
+    note tells the LLM the context is partial so its summary doesn't
+    pretend to cover the early session. Both `PreCompact` and
+    `memory_consolidate` triggers benefit from the fix — both were silently
+    failing into the `warn!()` catchall on sessions this long.
+  - 5 unit tests guard the windowing invariants (empty input, fits-under-
+    budget passthrough, most-recent-preserved, single-too-large-obs drops
+    everything, observation-boundary alignment). No schema change, no
+    config knob, backward-compatible for sessions that already fit.
+
 ## [0.8.0] - 2026-05-30
 
 ### Added
