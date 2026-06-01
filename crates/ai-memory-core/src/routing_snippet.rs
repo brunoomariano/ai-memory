@@ -70,7 +70,7 @@ match the intent to the tool. They do not need to name the tool.
 | "save context for the next session" / wrapping up | `memory_handoff_begin` (single-use handoff; terse summary; put detail in `open_questions` + `next_steps` bullets) |
 | "consolidate this session" / "compile what we learned" (also runs on PreCompact; at session end only if `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set) | `memory_consolidate` |
 | "remember this permanently" / "save a note" / "add an annotation" / durable project knowledge | `memory_write_page` (write a wiki page; do **not** use handoff for permanent notes) |
-| "read the page about X" / "show me the full content of Y" / "open the page on Z" | `memory_read_page` (full body; pass a query to search or `path` for a direct lookup) |
+| "read the page about X" / "show me the full content of Y" / "open the page on Z" | `memory_read_page` (full body; pass a query to search or `path` for a direct lookup; pass `workspace` + `project` together only for a named sibling workspace/project) |
 | "audit the wiki" / "find contradictions" / "what rules should we add?" | `memory_lint` |
 | "prune old pages" / "memory cleanup" | `memory_forget_sweep` |
 
@@ -97,7 +97,8 @@ project** — shared `infra`, `ops`, or a related app. Don't conclude
 short snippet does **not** mean the page is empty (a large page can
 match outside the snippet window). To read the whole page, use
 `memory_read_page` (by `path`, or pass a `query` to fetch the top hit's
-full body).
+full body; add `workspace` + `project` together only when the user names
+a sibling workspace/project).
 
 ### When you write a project rule, write it here
 

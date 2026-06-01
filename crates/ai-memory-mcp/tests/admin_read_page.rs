@@ -1,7 +1,7 @@
 //! Integration tests for `GET /admin/read-page`, focused on the DB-backed
-//! fallback: when the on-disk markdown read fails (index ahead of disk), the
-//! handler serves the store's faithful copy instead of 404ing
-//! (gotchas/read-page-by-query-misses).
+//! fallback: when the on-disk markdown file is missing (index ahead of disk),
+//! the handler serves the store's faithful copy instead of 404ing
+//! (gotchas/read-page-by-query-misses), while real parse errors still surface.
 
 use ai_memory_core::{NewPage, PagePath, Tier};
 use ai_memory_mcp::{AdminState, admin_router};
@@ -99,6 +99,7 @@ async fn read_page_falls_back_to_db_when_file_missing() {
         "{body}"
     );
     assert_eq!(body["title"], "DB Only", "{body}");
+    assert_eq!(body["served_from"], "db-fallback", "{body}");
 }
 
 /// Sanity: a page written through the wiki (disk + index) is served from disk
@@ -146,6 +147,65 @@ async fn read_page_serves_on_disk_page() {
         "written to disk via the wiki",
         "{body}"
     );
+    assert!(body.get("served_from").is_none(), "{body}");
+}
+
+/// A malformed markdown source must not be hidden by the DB fallback. The disk
+/// file is the source of truth; parse errors need to be visible to operators.
+#[tokio::test]
+async fn read_page_does_not_fall_back_when_disk_frontmatter_is_malformed() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch".to_string(), None)
+        .await
+        .unwrap();
+    let path = PagePath::new("notes/malformed.md").unwrap();
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: path.clone(),
+            frontmatter: serde_json::json!({"title": "Stored Copy"}),
+            body: "stored copy must not mask a malformed disk file".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Stored Copy".into()),
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+    let abs = state.wiki.abs_path(ws, proj, &path);
+    std::fs::write(
+        &abs,
+        "---\ntitle: [unterminated\n---\nmalformed disk body\n",
+    )
+    .unwrap();
+
+    let resp = get(
+        state,
+        "/admin/read-page?workspace=default&project=scratch&path=notes%2Fmalformed.md",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("frontmatter yaml"),
+        "{body}"
+    );
+    assert!(body.get("served_from").is_none(), "{body}");
 }
 
 /// A genuinely-absent page (no DB row, no file) still 404s — the fallback

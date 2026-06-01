@@ -10,7 +10,7 @@ use ai_memory_core::{
 };
 use ai_memory_llm::{Embedder, LlmProvider};
 use ai_memory_store::{DecayParams, PageHit, ReaderPool, WriterHandle};
-use ai_memory_wiki::{Wiki, WritePageRequest};
+use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -80,7 +80,9 @@ the conversation calls for them:\n\
   do NOT use `memory_handoff_begin` for permanent annotations.\n\
 - `memory_read_page` — when the user asks to read, open, or show the \
   full content of a specific page. Accepts a `query` (searches FTS5 and \
-  returns the top hit's full body) or a `path` (direct lookup). Use \
+  returns the top hit's full body) or a `path` (direct lookup). Pass \
+  `workspace` + `project` together only when reading a page from a named \
+  sibling workspace/project. Use \
   this instead of memory_query when the user wants the complete text, \
   not just snippets.\n\
 - `memory_lint` — when the user asks to audit the wiki for stale \
@@ -108,7 +110,8 @@ it' after one project misses. Note also that `memory_query` returns \
 SNIPPETS, not full page bodies — an empty or short snippet does NOT \
 mean the page is empty (a large page can match outside the snippet \
 window); to read the whole page use `memory_read_page` (by `path`, \
-or a `query` for the top hit's body).\n\
+or a `query` for the top hit's body; add `workspace` + `project` \
+together only for a named sibling workspace/project).\n\
 \n\
 The routing snippet this very text comes from can also be installed \
 into the project's CLAUDE.md / AGENTS.md so the guidance survives \
@@ -1035,7 +1038,8 @@ impl AiMemoryServer {
 
     /// Fetch the full body of a single wiki page.
     #[tool(description = "Fetch the FULL body of a wiki page for the current \
-        project. Use this when the user asks to read, open, or show a specific \
+        project by default. Pass `workspace` + `project` together only when \
+        the user names a sibling workspace/project. Use this when the user asks to read, open, or show a specific \
         page by name or topic — not just snippets. \
         \
         Two modes: \
@@ -1044,7 +1048,8 @@ impl AiMemoryServer {
         (2) pass `path` — direct lookup by the page's relative wiki path \
         (e.g. `notes/budget.md`). `path` takes precedence when both are given. \
         \
-        Returns `{ path, title, body, frontmatter }`. Errors if the page is \
+        Returns `{ path, title, body, frontmatter }` (plus `served_from` when \
+        a missing markdown file is served from the DB fallback). Errors if the page is \
         not found or neither argument is supplied.")]
     async fn memory_read_page(
         &self,
@@ -1088,11 +1093,9 @@ impl AiMemoryServer {
             ));
         };
 
-        // Markdown on disk is the source of truth, but the on-disk read can
-        // fail when the index is momentarily ahead of disk (recently-written
-        // page, or a known watcher/disk skew — gotchas/read-page-by-query-misses).
-        // Fall back to the DB's faithful copy before surfacing an error so the
-        // agent never wrongly concludes a page it can see in search is gone.
+        // Markdown on disk is the source of truth. Only a missing markdown file
+        // uses the DB fallback; parse/permission/corruption errors must surface
+        // so operators can fix the disk source of truth.
         match wiki.read_page(ws, proj, &page_path) {
             Ok(md) => {
                 let title = md
@@ -1107,7 +1110,7 @@ impl AiMemoryServer {
                     "frontmatter": md.frontmatter,
                 }))
             }
-            Err(disk_err) => {
+            Err(disk_err) if is_missing_wiki_file(&disk_err) => {
                 match self
                     .reader
                     .page_body_by_ids(ws, proj, page_path.as_str())
@@ -1134,6 +1137,7 @@ impl AiMemoryServer {
                     None => Err(McpError::internal_error(disk_err.to_string(), None)),
                 }
             }
+            Err(disk_err) => Err(McpError::internal_error(disk_err.to_string(), None)),
         }
     }
 
@@ -1412,6 +1416,10 @@ fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(s)]))
 }
 
+fn is_missing_wiki_file(err: &WikiError) -> bool {
+    matches!(err, WikiError::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn trimmed_opt(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
 }
@@ -1530,7 +1538,7 @@ mod tests {
     use super::*;
     use ai_memory_core::{NewObservation, NewPage, NewSession, ObservationKind, PagePath, Tier};
     use ai_memory_store::Store;
-    use ai_memory_wiki::Wiki;
+    use ai_memory_wiki::{Wiki, WritePageRequest};
     use tempfile::TempDir;
 
     async fn setup_server() -> (TempDir, Store, AiMemoryServer, WorkspaceId, ProjectId) {
@@ -1990,6 +1998,108 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(text.contains("patterns.md"), "expected hit; got {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_read_page_can_target_explicit_workspace_project() {
+        let (tmp, store, server, _ws, _pj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let practice_ws = store
+            .writer
+            .get_or_create_workspace("practice")
+            .await
+            .unwrap();
+        let docs = store
+            .writer
+            .get_or_create_project(practice_ws, "docs", None)
+            .await
+            .unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: practice_ws,
+            project_id: docs,
+            path: PagePath::new("notes/sibling.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Sibling Page"}),
+            body: "workspace explicit read body".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("Sibling Page".into()),
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let result = server
+            .with_wiki(wiki)
+            .memory_read_page(Parameters(ReadPageArgs {
+                query: None,
+                path: Some("notes/sibling.md".into()),
+                project: Some("docs".into()),
+                workspace: Some("practice".into()),
+            }))
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("workspace explicit read body"),
+            "expected sibling workspace body; got {text}"
+        );
+        assert!(
+            text.contains("notes/sibling.md"),
+            "expected sibling workspace path; got {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_read_page_marks_db_fallback_when_file_missing() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/db-only-tool.md").unwrap(),
+                title: "DB Only Tool".into(),
+                body: "tool fallback body".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({"title": "DB Only Tool"}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .with_wiki(wiki)
+            .memory_read_page(Parameters(ReadPageArgs {
+                query: None,
+                path: Some("notes/db-only-tool.md".into()),
+                project: None,
+                workspace: None,
+            }))
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("tool fallback body"),
+            "expected DB body; got {text}"
+        );
+        assert!(
+            text.contains("db-fallback"),
+            "expected fallback diagnostic; got {text}"
+        );
     }
 
     #[tokio::test]

@@ -36,7 +36,7 @@ use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapsho
 use ai_memory_store::{
     DecayParams, EmbeddingWrite, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes,
 };
-use ai_memory_wiki::{Wiki, WritePageRequest};
+use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
@@ -394,6 +394,8 @@ struct ReadPageResponse {
     title: Option<String>,
     body: String,
     frontmatter: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    served_from: Option<&'static str>,
 }
 
 async fn handle_read_page(
@@ -455,15 +457,16 @@ async fn handle_read_page(
                 title,
                 body: md.body,
                 frontmatter: md.frontmatter,
+                served_from: None,
             };
             (
                 StatusCode::OK,
                 Json(serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({}))),
             )
         }
-        // On-disk read failed — fall back to the DB's faithful copy before
-        // 404ing (index/disk skew; see gotchas/read-page-by-query-misses).
-        Err(disk_err) => match state
+        // Only a missing markdown file can fall back to the DB copy. Other disk
+        // errors belong to the source-of-truth file and must be surfaced.
+        Err(disk_err) if is_missing_wiki_file(&disk_err) => match state
             .reader
             .page_body_by_ids(ws, proj, page_path.as_str())
             .await
@@ -483,6 +486,7 @@ async fn handle_read_page(
                     title,
                     body: stored.body,
                     frontmatter,
+                    served_from: Some("db-fallback"),
                 };
                 (
                     StatusCode::OK,
@@ -495,6 +499,7 @@ async fn handle_read_page(
             ),
             Err(e) => internal_err(e.to_string()),
         },
+        Err(disk_err) => internal_err(disk_err.to_string()),
     }
 }
 
@@ -508,6 +513,10 @@ fn internal_err(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>)
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({ "error": msg.into() })),
     )
+}
+
+fn is_missing_wiki_file(err: &WikiError) -> bool {
+    matches!(err, WikiError::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Resolve workspace + project IDs, creating them if absent. Returns
