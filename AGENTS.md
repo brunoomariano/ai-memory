@@ -68,6 +68,9 @@ without disturbing the rest of the file.
   `CHANGELOG.md` and the README/docs support references in the same commit.
 - Do not bump crate/package versions or cut release tags automatically after
   every merged PR. Ask the user before any version bump or release tag.
+- When asked to evaluate a PR, report the pros, cons, and recommended fix,
+  then ask the user for approval before merging or pushing PR changes. Do not
+  merge PRs during evaluation unless the user explicitly approves that action.
 - When the MCP tool surface changes, update `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and regression
   tests that assert every tool appears in both prompt surfaces.
