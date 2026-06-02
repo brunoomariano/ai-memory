@@ -1982,6 +1982,112 @@ async fn handle_move_project(
         Err(e) => return e,
     };
 
+    copy_purge_merge(&state, &req, src_ws, src_proj, dst_ws, dst_proj).await
+}
+
+/// One source page, with everything the copy loop and the block
+/// pre-check both need. Built in ONE pass over the source listing so
+/// the previous two-pass implementation's double-IO (pre-scan + copy
+/// loop each calling `page_meta` + `page_body_by_ids` + `read_page`)
+/// collapses to a single read per page.
+struct PreparedSourcePage {
+    path: PagePath,
+    /// Path as a String — only needed for reports / `pages_skipped`
+    /// and `dedup` lookups; kept here so we don't keep recomputing.
+    path_str: String,
+    title: String,
+    tier: Tier,
+    pinned: bool,
+    /// `Some(md)` when the on-disk source survived parsing; `None` when
+    /// reading or parsing failed and the page must be skipped (the
+    /// safety guard at the end of the merge will refuse to purge).
+    md: Option<Markdown>,
+    /// `true` when the destination already holds this path with a
+    /// DIFFERENT page (body / frontmatter / title / tier / pinned).
+    /// `false` when there's no destination row, the destination
+    /// matches verbatim (no-op supersession), or the source itself
+    /// couldn't be parsed and we'd skip it anyway.
+    dest_conflict: bool,
+}
+
+/// Load every source page (metadata + body) and pre-classify whether
+/// its path collides with a different page at the destination. Both
+/// the `Block` pre-check and the copy loop drive off the returned
+/// vector, so each page is read at most once.
+async fn prepare_source_pages(
+    state: &AdminState,
+    req: &MoveProjectRequest,
+    src_ws: WorkspaceId,
+    src_proj: ProjectId,
+    dst_ws: WorkspaceId,
+    dst_proj: ProjectId,
+    summaries: &[ai_memory_store::PageSummary],
+) -> Vec<PreparedSourcePage> {
+    let mut out = Vec::with_capacity(summaries.len());
+    for s in summaries {
+        let Ok(path) = PagePath::new(s.path.clone()) else {
+            // Unparseable path — record a "skip" entry so the copy
+            // loop can report it without re-trying the lookup.
+            out.push(PreparedSourcePage {
+                path: PagePath::new("invalid.md".to_string()).expect("valid placeholder"),
+                path_str: s.path.clone(),
+                title: s.title.clone(),
+                tier: Tier::Semantic,
+                pinned: false,
+                md: None,
+                dest_conflict: false,
+            });
+            continue;
+        };
+        let tier: Tier = s.tier.parse().unwrap_or(Tier::Semantic);
+        let pinned = matches!(
+            state.reader.page_meta(&req.from_workspace, &req.project, &s.path).await,
+            Ok(Some(ref m)) if m.pinned
+        );
+        let md = state.wiki.read_page(src_ws, src_proj, &path).ok();
+        // Compute the conflict decision once. The check is "is there a
+        // DIFFERENT page at this path?", which requires both the dest
+        // body and the source markdown — when either is missing, treat
+        // as no-conflict and let the copy loop's natural-path branch
+        // handle it (it'll either supersede a no-op or skip with a
+        // missing-md guard).
+        let dest_conflict = matches!(
+            (
+                state
+                    .reader
+                    .page_body_by_ids(dst_ws, dst_proj, s.path.as_str())
+                    .await,
+                &md,
+            ),
+            (Ok(Some(existing)), Some(md_ref))
+                if page_copy_differs(&existing, md_ref, &s.title, tier, pinned)
+        );
+        out.push(PreparedSourcePage {
+            path,
+            path_str: s.path.clone(),
+            title: s.title.clone(),
+            tier,
+            pinned,
+            md,
+            dest_conflict,
+        });
+    }
+    out
+}
+
+/// Execute the copy-purge merge once the destination has been
+/// resolved. Pulled out of `handle_move_project` so the orchestrator
+/// reads as "validate → branch → copy_purge_merge", and the copy
+/// loop's per-page IO runs through a pre-computed `PreparedSourcePage`
+/// instead of fetching the same metadata twice.
+async fn copy_purge_merge(
+    state: &AdminState,
+    req: &MoveProjectRequest,
+    src_ws: WorkspaceId,
+    src_proj: ProjectId,
+    dst_ws: WorkspaceId,
+    dst_proj: ProjectId,
+) -> (StatusCode, Json<serde_json::Value>) {
     // Enumerate the source's latest pages (authoritative on is_latest).
     let summaries = match state
         .reader
@@ -1992,32 +2098,23 @@ async fn handle_move_project(
         Err(e) => return internal_err(e.to_string()),
     };
 
-    // Pre-scan for same-path conflicts (destination already holds the path with
-    // a different body, frontmatter, title, tier, or pinned bit). Under the
-    // default `block` policy, abort the WHOLE move now — before anything is
-    // copied — so the source stays intact and the operator resolves them or
-    // re-runs with an explicit overwrite/duplicate.
+    // Single pass over the source: load each page's metadata + body
+    // AND classify the destination conflict, so the block pre-check
+    // and the copy loop don't re-query the same rows.
+    let prepared =
+        prepare_source_pages(state, req, src_ws, src_proj, dst_ws, dst_proj, &summaries).await;
+
+    // Under the default `block` policy, abort the WHOLE move now —
+    // before anything is copied — so the source stays intact and the
+    // operator resolves the conflicts or re-runs with an explicit
+    // overwrite/duplicate. Drives off the cached `dest_conflict_body`
+    // computed by `prepare_source_pages`.
     if req.on_conflict == OnConflict::Block {
-        let mut blocking: Vec<String> = Vec::new();
-        for s in &summaries {
-            let Ok(path) = PagePath::new(s.path.clone()) else {
-                continue;
-            };
-            let tier: Tier = s.tier.parse().unwrap_or(Tier::Semantic);
-            let pinned = matches!(
-                state.reader.page_meta(&req.from_workspace, &req.project, &s.path).await,
-                Ok(Some(ref m)) if m.pinned
-            );
-            if let Ok(Some(existing)) = state
-                .reader
-                .page_body_by_ids(dst_ws, dst_proj, s.path.as_str())
-                .await
-                && let Ok(md) = state.wiki.read_page(src_ws, src_proj, &path)
-                && page_copy_differs(&existing, &md, &s.title, tier, pinned)
-            {
-                blocking.push(s.path.clone());
-            }
-        }
+        let blocking: Vec<String> = prepared
+            .iter()
+            .filter(|p| p.dest_conflict)
+            .map(|p| p.path_str.clone())
+            .collect();
         if !blocking.is_empty() {
             return (
                 StatusCode::CONFLICT,
@@ -2069,93 +2166,75 @@ async fn handle_move_project(
 
     // COPY each page through the (embedder-less) write path so sanitization,
     // link re-resolution, FTS upsert (and admission/git-mirror on deploy) all
-    // fire — minus the per-page embed, which we carry over below.
+    // fire — minus the per-page embed, which we carry over below. Drives off
+    // the prebuilt `PreparedSourcePage` vec so each page is read at most
+    // once across the whole merge (the previous version re-fetched in the
+    // pre-scan + the copy loop for Block-policy callers).
     let mut pages_copied = 0u64;
     let mut pages_skipped: Vec<String> = Vec::new();
     let mut conflicts: Vec<PathConflict> = Vec::new();
     let mut used_dest_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for s in &summaries {
-        let path = match PagePath::new(s.path.clone()) {
-            Ok(p) => p,
-            Err(_) => {
-                pages_skipped.push(s.path.clone());
-                continue;
-            }
+    for p in prepared {
+        let Some(md) = p.md else {
+            // Either the path was unparseable or `read_page` failed —
+            // either way we cannot copy it. The presence of a skip
+            // here aborts the purge below.
+            warn!(
+                path = %p.path_str,
+                "move-project: source page unreadable or invalid path; skipping"
+            );
+            pages_skipped.push(p.path_str.clone());
+            continue;
         };
-        let tier: Tier = s.tier.parse().unwrap_or(Tier::Semantic);
-        let pinned = matches!(
-            state.reader.page_meta(&req.from_workspace, &req.project, &s.path).await,
-            Ok(Some(ref m)) if m.pinned
-        );
-        let md = match state.wiki.read_page(src_ws, src_proj, &path) {
-            Ok(md) => md,
-            Err(e) => {
-                warn!(path = %s.path, error = %e, "move-project: source read failed; skipping");
-                pages_skipped.push(s.path.clone());
-                continue;
-            }
-        };
-        // Same-path conflict (destination holds this path with DIFFERENT page
-        // body/metadata): apply the on_conflict policy. Identical pages always
-        // fall through to a no-op supersession at the same path. `block` was
-        // already handled by the pre-scan above (we never get here with a real
-        // conflict).
-        let dest_path = match state
-            .reader
-            .page_body_by_ids(dst_ws, dst_proj, s.path.as_str())
-            .await
-        {
-            Ok(Some(existing)) if page_copy_differs(&existing, &md, &s.title, tier, pinned) => {
-                match req.on_conflict {
-                    OnConflict::Duplicate => {
-                        let deduped = dedup_dest_path(
-                            &state,
-                            dst_ws,
-                            dst_proj,
-                            &s.path,
-                            &req.from_workspace,
-                            &used_dest_paths,
-                        )
-                        .await;
-                        conflicts.push(PathConflict {
-                            path: s.path.clone(),
-                            moved_to: deduped.as_str().to_string(),
-                        });
-                        deduped
-                    }
-                    // Overwrite: the source page supersedes the destination page at
-                    // the same path (the dest's prior version becomes history).
-                    OnConflict::Overwrite => {
-                        conflicts.push(PathConflict {
-                            path: s.path.clone(),
-                            moved_to: s.path.clone(),
-                        });
-                        path.clone()
-                    }
-                    OnConflict::Block => path.clone(),
+        // Apply the on_conflict policy using the cached classification.
+        // `block` was already handled by the pre-scan above so we never
+        // get here with `dest_conflict == true` AND `policy == Block`.
+        let dest_path = if p.dest_conflict {
+            match req.on_conflict {
+                OnConflict::Duplicate => {
+                    let deduped = dedup_dest_path(
+                        state,
+                        dst_ws,
+                        dst_proj,
+                        &p.path_str,
+                        &req.from_workspace,
+                        &used_dest_paths,
+                    )
+                    .await;
+                    conflicts.push(PathConflict {
+                        path: p.path_str.clone(),
+                        moved_to: deduped.as_str().to_string(),
+                    });
+                    deduped
                 }
+                OnConflict::Overwrite => {
+                    conflicts.push(PathConflict {
+                        path: p.path_str.clone(),
+                        moved_to: p.path_str.clone(),
+                    });
+                    p.path.clone()
+                }
+                OnConflict::Block => p.path.clone(), // unreachable
             }
-            // No content conflict — but the natural path may already have been
-            // CLAIMED by an earlier page's de-duplication (duplicate mode). If
-            // so, de-duplicate this one too rather than clobbering the page that
-            // already took the slot.
-            _ if used_dest_paths.contains(s.path.as_str()) => {
-                let deduped = dedup_dest_path(
-                    &state,
-                    dst_ws,
-                    dst_proj,
-                    &s.path,
-                    &req.from_workspace,
-                    &used_dest_paths,
-                )
-                .await;
-                conflicts.push(PathConflict {
-                    path: s.path.clone(),
-                    moved_to: deduped.as_str().to_string(),
-                });
-                deduped
-            }
-            _ => path.clone(),
+        } else if used_dest_paths.contains(p.path_str.as_str()) {
+            // The natural path is already claimed by an earlier
+            // de-duplicated page; pick another to avoid clobbering it.
+            let deduped = dedup_dest_path(
+                state,
+                dst_ws,
+                dst_proj,
+                &p.path_str,
+                &req.from_workspace,
+                &used_dest_paths,
+            )
+            .await;
+            conflicts.push(PathConflict {
+                path: p.path_str.clone(),
+                moved_to: deduped.as_str().to_string(),
+            });
+            deduped
+        } else {
+            p.path.clone()
         };
         used_dest_paths.insert(dest_path.as_str().to_string());
         let new_page_id = match copy_wiki
@@ -2165,11 +2244,11 @@ async fn handle_move_project(
                 path: dest_path.clone(),
                 frontmatter: md.frontmatter,
                 body: md.body,
-                tier,
-                pinned,
+                tier: p.tier,
+                pinned: p.pinned,
                 // Preserve the stored title verbatim (PageSummary.title is
                 // the DB-derived title), rather than re-deriving it.
-                title: Some(s.title.clone()),
+                title: Some(p.title.clone()),
                 // None → the write_page admission chain resolves the
                 // workspace/project NAMES from the destination IDs, so the
                 // git-mirror lands the copy under the destination path.
@@ -2181,12 +2260,12 @@ async fn handle_move_project(
         {
             Ok(pid) => pid,
             // ANY copy failure aborts BEFORE the purge — the source survives.
-            Err(e) => return internal_err(format!("copy of {} failed: {e}", s.path)),
+            Err(e) => return internal_err(format!("copy of {} failed: {e}", p.path_str)),
         };
         // Carry the source embedding over (skip the re-embed) when the source
         // had one for the current model.
         if let (Some((provider, model, dim)), Some(bytes)) =
-            (&embed_meta, src_embeddings.get(&s.path))
+            (&embed_meta, src_embeddings.get(&p.path_str))
             && let Err(e) = state
                 .writer
                 .store_embedding(
@@ -2198,7 +2277,7 @@ async fn handle_move_project(
                 )
                 .await
         {
-            warn!(path = %s.path, error = %e, "move-project: failed to carry embedding; page copied without it");
+            warn!(path = %p.path_str, error = %e, "move-project: failed to carry embedding; page copied without it");
         }
         pages_copied += 1;
     }
@@ -2210,7 +2289,9 @@ async fn handle_move_project(
         let report = MoveProjectReport {
             from: format!("{}/{}", req.from_workspace, req.project),
             to: format!("{}/{}", req.to_workspace, req.project),
-            merged_into_existing,
+            // copy_purge_merge is only reached from the merge branch
+            // of handle_move_project; the destination project pre-existed.
+            merged_into_existing: true,
             moved_via: "copy-purge",
             pages_copied,
             pages_skipped,
@@ -2299,7 +2380,8 @@ async fn handle_move_project(
     let report = MoveProjectReport {
         from: label,
         to: format!("{}/{}", req.to_workspace, req.project),
-        merged_into_existing,
+        // copy_purge_merge is only reached from the merge branch.
+        merged_into_existing: true,
         moved_via: "copy-purge",
         pages_copied,
         pages_skipped: Vec::new(),
