@@ -754,7 +754,7 @@ fn build_opencode_plugin(server_url: &str, auth_token: Option<&str>) -> String {
 
 import type {{ Plugin }} from "@opencode-ai/plugin";
 import {{ existsSync, readFileSync }} from "node:fs";
-import {{ dirname, join, resolve }} from "node:path";
+import {{ basename, dirname, join, resolve }} from "node:path";
 import {{ homedir }} from "node:os";
 
 const SERVER = {server_literal}.replace(/\/+$/, "");
@@ -805,6 +805,9 @@ function applyMarkerParams(url: URL, cwd: string | undefined): void {{
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
     if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
+    if (!project && projectStrategy === "repo-root") {{
+      url.searchParams.set("project", basename(dirname(marker)));
+    }}
   }} catch (_e) {{
   }}
 }}
@@ -1038,7 +1041,7 @@ fn build_omp_extension(server_url: &str, auth_token: Option<&str>) -> String {
 // re-run.
 
 import {{ existsSync, readFileSync }} from "node:fs";
-import {{ dirname, join, resolve }} from "node:path";
+import {{ basename, dirname, join, resolve }} from "node:path";
 import {{ homedir }} from "node:os";
 
 const SERVER = {server_literal}.replace(/\/+$/, "");
@@ -1089,6 +1092,9 @@ function applyMarkerParams(url: URL, cwd: string | undefined): void {{
     if (workspace) url.searchParams.set("workspace", workspace);
     if (project) url.searchParams.set("project", project);
     if (projectStrategy) url.searchParams.set("project_strategy", projectStrategy);
+    if (!project && projectStrategy === "repo-root") {{
+      url.searchParams.set("project", basename(dirname(marker)));
+    }}
   }} catch (_e) {{
   }}
 }}
