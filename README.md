@@ -81,7 +81,9 @@ priors are at the [bottom](#influences-and-prior-art).
   Gemini CLI, Antigravity CLI, OpenClaw, and Oh My Pi / OMP
   (`pi` / `omp` aliases).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
-  with bearer-token auth.
+  with bearer-token auth. Shared servers can opt into
+  [`[auto_scope]` modes](docs/auto-scope.md) for per-user or
+  session-aware current-project routing.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `purge-project`,
   `rename-project`, `move-project`, `lint`, `embed`, `forget-sweep`, `backup` are
   all HTTP clients of the running server - never touch SQLite or
@@ -492,6 +494,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, routing snippet, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
+| [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, native source builds, and current hook/MCP harness caveats. |
 | [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes (Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP). |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, pointers to the TLS guide. |

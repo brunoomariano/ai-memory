@@ -537,16 +537,67 @@ impl AiMemoryServer {
         self
     }
 
+    /// Build the [`ActorKey`] for a tool call from the request's stored
+    /// extensions and headers.
+    ///
+    /// - `user` is taken from the middleware-injected
+    ///   [`ai_memory_core::ActorContext`] (rung 1 root, rung 2 DB user) —
+    ///   never from raw client-supplied headers, since user identity is
+    ///   security-critical.
+    /// - `session_id` comes from the same `ActorContext` when the auth
+    ///   middleware filled it; if not, falls back to the rung-4
+    ///   `X-Memory-Actor-Session-Id` request header, then to the standard
+    ///   MCP `Mcp-Session-Id` header. The session id is just a cache key
+    ///   for the active-project map — getting it wrong only routes the
+    ///   lookup to a different (or absent) slot, with no auth-bypass risk,
+    ///   so trusting the header here is safe.
+    ///
+    /// Returns the empty [`ActorKey`] when neither source has anything to
+    /// offer; that's the graceful-degradation signal for callers to fall
+    /// back to the single slot.
+    fn actor_key_from_parts(
+        parts: Option<&axum::http::request::Parts>,
+    ) -> ai_memory_core::ActorKey {
+        let Some(parts) = parts else {
+            return ai_memory_core::ActorKey::default();
+        };
+        let ctx = parts.extensions.get::<ai_memory_core::ActorContext>();
+        let user = ctx.and_then(|c| c.user.clone());
+        let header_session = |name: &str| {
+            parts
+                .headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let session_id = ctx
+            .and_then(|c| c.session_id.clone())
+            .or_else(|| header_session("x-memory-actor-session-id"))
+            .or_else(|| header_session("mcp-session-id"));
+        ai_memory_core::ActorKey { user, session_id }
+    }
+
     /// Resolve which `(workspace_id, project_id)` a read tool should
     /// query. Precedence (matches the documented resolution chain):
     ///   1. an explicit `project` name argument in the active workspace
-    ///      when hooks have published one,
+    ///      when hooks have published one (for THIS actor),
     ///   2. that same explicit `project` in the server's baked workspace,
     ///   3. the hook-published [`ActiveProject`] (the cwd the agent is
-    ///      currently working in),
+    ///      currently working in, keyed by `actor` in opt-in isolation
+    ///      modes),
     ///   4. the server's baked-in `--project` default.
-    async fn effective_ids(&self, explicit_project: Option<&str>) -> (WorkspaceId, ProjectId) {
-        let active = self.active_project.get();
+    ///
+    /// `actor` is built by [`Self::actor_key_from_parts`]; pass
+    /// `ActorKey::default()` when the call site has no request context.
+    /// Empty actor → fall back to the single slot (legacy behaviour).
+    async fn effective_ids_with_actor(
+        &self,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+    ) -> (WorkspaceId, ProjectId) {
+        let active = self.active_project.get_for(actor);
         if let Some(name) = explicit_project.map(str::trim).filter(|s| !s.is_empty()) {
             if let Some((active_ws, _)) = active
                 && let Ok(Some(pid)) = self.reader.find_project(active_ws, name.to_string()).await
@@ -565,10 +616,11 @@ impl AiMemoryServer {
         active.unwrap_or((self.workspace_id, self.project_id))
     }
 
-    async fn effective_ids_for_read_args(
+    async fn effective_ids_for_read_args_with_actor(
         &self,
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
         match (
             trimmed_opt(explicit_workspace),
@@ -579,7 +631,7 @@ impl AiMemoryServer {
                 "workspace and project must be provided together",
                 None,
             )),
-            (None, project) => Ok(self.effective_ids(project).await),
+            (None, project) => Ok(self.effective_ids_with_actor(project, actor).await),
         }
     }
 
@@ -621,17 +673,37 @@ impl AiMemoryServer {
     /// `bar/foo`. To target the baked/shared workspace explicitly, pass
     /// `workspace`. Falls back to the baked default only when no `ActiveProject`
     /// has been published yet (early startup / no hooks).
+    /// Legacy single-slot wrapper retained for test fixtures that pre-date
+    /// the actor-aware variant. Production tools must use
+    /// [`Self::write_target_ids_with_actor`] so per-session/per-actor
+    /// isolation modes route the write to the caller's project, not
+    /// whichever single-slot value was published last.
+    #[cfg(test)]
     async fn write_target_ids(
         &self,
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        self.write_target_ids_with_actor(
+            explicit_workspace,
+            explicit_project,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+    }
+
+    async fn write_target_ids_with_actor(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
         let Some(project) = trimmed_opt(explicit_project) else {
             // No explicit project → current project (hook-published active, or
             // the baked default). Explicit workspace alone has nothing to scope.
             return Ok(self
                 .active_project
-                .get()
+                .get_for(actor)
                 .unwrap_or((self.workspace_id, self.project_id)));
         };
         let workspace_id = match trimmed_opt(explicit_workspace) {
@@ -644,7 +716,7 @@ impl AiMemoryServer {
             // baked global default — keeps writes consistent with reads.
             None => self
                 .active_project
-                .get()
+                .get_for(actor)
                 .map(|(ws, _)| ws)
                 .unwrap_or(self.workspace_id),
         };
@@ -798,7 +870,9 @@ impl AiMemoryServer {
     async fn memory_query(
         &self,
         Parameters(args): Parameters<QueryArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
         if args.global.unwrap_or(false) {
             if !args.scopes.is_empty()
@@ -847,7 +921,11 @@ impl AiMemoryServer {
         let query_vec = self.embed_query(&args.query).await;
         let hits = if args.scopes.is_empty() {
             let (ws, proj) = self
-                .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+                .effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                )
                 .await?;
             self.search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
                 .await
@@ -885,7 +963,11 @@ impl AiMemoryServer {
         // project; for multi-scope queries there is no single (ws, proj).
         let raw_hits = if hits.is_empty() && args.scopes.is_empty() {
             let (ws, proj) = self
-                .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+                .effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                )
                 .await?;
             self.reader
                 .search_observations_for_project(ws, proj, query, limit)
@@ -912,10 +994,16 @@ impl AiMemoryServer {
     async fn memory_recent(
         &self,
         Parameters(args): Parameters<RecentArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
         let (ws, proj) = self
-            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
             .await?;
         let hits = self
             .reader
@@ -937,9 +1025,15 @@ impl AiMemoryServer {
     async fn memory_forget_sweep(
         &self,
         Parameters(args): Parameters<SweepArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
             .await?;
         let report = run_sweep(
             &self.reader,
@@ -962,7 +1056,9 @@ impl AiMemoryServer {
     async fn memory_lint(
         &self,
         Parameters(args): Parameters<LintArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
             return Err(McpError::internal_error(
                 "memory_lint requires the server to be built with a wiki handle",
@@ -970,7 +1066,11 @@ impl AiMemoryServer {
             ));
         };
         let (ws, proj) = self
-            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
             .await?;
         let report = run_lint(
             &self.reader,
@@ -1043,6 +1143,7 @@ impl AiMemoryServer {
         Parameters(args): Parameters<WritePageArgs>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
             return Err(McpError::internal_error(
                 "memory_write_page requires the server to be built with a wiki handle",
@@ -1056,7 +1157,11 @@ impl AiMemoryServer {
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let (ws, proj) = self
-            .write_target_ids(args.workspace.as_deref(), args.project.as_deref())
+            .write_target_ids_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
             .await?;
 
         let mut fm = serde_json::Map::new();
@@ -1145,7 +1250,9 @@ impl AiMemoryServer {
     async fn memory_read_page(
         &self,
         Parameters(args): Parameters<ReadPageArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
             return Err(McpError::internal_error(
                 "memory_read_page requires the server to be built with a wiki handle",
@@ -1156,7 +1263,11 @@ impl AiMemoryServer {
         // can target a page in a DIFFERENT workspace (a sibling project on a
         // shared server). Plain `project` keeps the active-project chain.
         let (ws, proj) = self
-            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
             .await?;
 
         let page_path = if let Some(p) = args.path {
@@ -1247,6 +1358,7 @@ impl AiMemoryServer {
         Parameters(args): Parameters<DeletePageArgs>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
             return Err(McpError::internal_error(
                 "memory_delete_page requires the server to be built with a wiki handle",
@@ -1255,12 +1367,12 @@ impl AiMemoryServer {
         };
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
-        // Same resolution as read/write tools: when (workspace, project) are
-        // BOTH given, they're looked up explicitly; otherwise the cwd-based
-        // active-project chain is used. Closes the silent cross-workspace
-        // delete that the single-arg `effective_ids(project)` allowed.
         let (ws, proj) = self
-            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
             .await?;
 
         // Carry actor identity + loop-prevention skip list (same as write_page).
@@ -1305,14 +1417,18 @@ impl AiMemoryServer {
     async fn memory_handoff_begin(
         &self,
         Parameters(args): Parameters<HandoffBeginArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         // Handoffs bypass `Wiki::write_page` (they live in their own
         // table), so scrub the agent-supplied free-text here. We don't
         // touch `cwd` or `files_touched` — they're path lists that the
         // path-pattern regexes already cover when applicable, but we
         // pass each entry through anyway as defence-in-depth.
         let s = &self.sanitizer;
-        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+        let (ws, proj) = self
+            .effective_ids_with_actor(args.project.as_deref(), &aps_actor)
+            .await;
         let handoff = NewHandoff {
             workspace_id: ws,
             project_id: proj,
@@ -1355,8 +1471,12 @@ impl AiMemoryServer {
     async fn memory_handoff_accept(
         &self,
         Parameters(args): Parameters<HandoffAcceptArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let (ws, proj) = self
+            .effective_ids_with_actor(args.project.as_deref(), &aps_actor)
+            .await;
         let handoff = self
             .reader
             .latest_open_handoff(ws, proj, args.cwd)
@@ -1386,11 +1506,17 @@ impl AiMemoryServer {
     async fn memory_handoff_cancel(
         &self,
         Parameters(args): Parameters<HandoffCancelArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let handoff_id = HandoffId::from_str(&args.handoff_id)
             .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
         let (ws, proj) = self
-            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
             .await?;
         let handoff = self
             .reader
@@ -1431,9 +1557,15 @@ impl AiMemoryServer {
     async fn memory_status(
         &self,
         Parameters(args): Parameters<StatusArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
             .await?;
         let counts = self
             .reader
@@ -1457,10 +1589,16 @@ impl AiMemoryServer {
     async fn memory_briefing(
         &self,
         Parameters(args): Parameters<BriefingArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.recent_pages_limit.unwrap_or(10);
         let (ws, proj) = self
-            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
             .await?;
         let snapshot = self
             .reader
@@ -1487,10 +1625,16 @@ impl AiMemoryServer {
     async fn memory_explore(
         &self,
         Parameters(args): Parameters<ExploreArgs>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.recent_pages_limit.unwrap_or(10);
         let (ws, proj) = self
-            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
             .await?;
         let snapshot = self
             .reader
@@ -1731,6 +1875,17 @@ fn build_explore_request(
 const EXPLORE_SYSTEM_PROMPT: &str = include_str!("../prompts/explore_system.md");
 
 #[cfg(test)]
+fn test_parts_default() -> axum::http::request::Parts {
+    axum::http::Request::builder()
+        .uri("/mcp")
+        .method("POST")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ai_memory_core::{NewObservation, NewPage, NewSession, ObservationKind, PagePath, Tier};
@@ -1770,6 +1925,57 @@ mod tests {
 
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
         (tmp, store, server, ws, proj)
+    }
+
+    #[test]
+    fn actor_key_uses_memory_session_header() {
+        let mut parts = test_parts_default();
+        parts.headers.insert(
+            "x-memory-actor-session-id",
+            axum::http::HeaderValue::from_static("hook-session"),
+        );
+
+        let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
+
+        assert_eq!(actor.user, None);
+        assert_eq!(actor.session_id.as_deref(), Some("hook-session"));
+    }
+
+    #[test]
+    fn actor_key_accepts_standard_mcp_session_header() {
+        let mut parts = test_parts_default();
+        parts.headers.insert(
+            "mcp-session-id",
+            axum::http::HeaderValue::from_static("mcp-session"),
+        );
+
+        let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
+
+        assert_eq!(actor.user, None);
+        assert_eq!(actor.session_id.as_deref(), Some("mcp-session"));
+    }
+
+    #[test]
+    fn actor_key_prefers_middleware_context_over_headers() {
+        let mut parts = test_parts_default();
+        parts.headers.insert(
+            "x-memory-actor-session-id",
+            axum::http::HeaderValue::from_static("header-session"),
+        );
+        parts.headers.insert(
+            "mcp-session-id",
+            axum::http::HeaderValue::from_static("mcp-session"),
+        );
+        parts.extensions.insert(ai_memory_core::ActorContext {
+            user: Some("alice".into()),
+            session_id: Some("context-session".into()),
+            ..ai_memory_core::ActorContext::default()
+        });
+
+        let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
+
+        assert_eq!(actor.user.as_deref(), Some("alice"));
+        assert_eq!(actor.session_id.as_deref(), Some("context-session"));
     }
 
     #[tokio::test]
@@ -1952,7 +2158,12 @@ mod tests {
         let (_tmp, store, server, ws, baked) = setup_server().await;
 
         // Baseline: nothing published, no arg → baked-in default.
-        assert_eq!(server.effective_ids(None).await, (ws, baked));
+        assert_eq!(
+            server
+                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default())
+                .await,
+            (ws, baked)
+        );
 
         // A second real project in the same workspace.
         let other = store
@@ -1967,11 +2178,18 @@ mod tests {
 
         // Hook publishes it → it becomes the default for cwd-less calls.
         server.active_project.set(ws, other);
-        assert_eq!(server.effective_ids(None).await, (ws, other));
+        assert_eq!(
+            server
+                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default())
+                .await,
+            (ws, other)
+        );
 
         // An explicit (existing) project arg wins over the active pointer.
         assert_eq!(
-            server.effective_ids(Some("scratch")).await,
+            server
+                .effective_ids_with_actor(Some("scratch"), &ai_memory_core::ActorKey::default())
+                .await,
             (ws, baked),
             "explicit project arg should override the active pointer"
         );
@@ -1979,7 +2197,12 @@ mod tests {
         // An explicit but unknown project name falls through to the
         // active pointer rather than erroring or returning a bogus id.
         assert_eq!(
-            server.effective_ids(Some("does-not-exist")).await,
+            server
+                .effective_ids_with_actor(
+                    Some("does-not-exist"),
+                    &ai_memory_core::ActorKey::default()
+                )
+                .await,
             (ws, other),
             "unknown explicit project falls through to the active pointer"
         );
@@ -2125,17 +2348,22 @@ mod tests {
             "direct read should see the written page"
         );
         assert_eq!(
-            server.effective_ids(Some("sibling")).await,
+            server
+                .effective_ids_with_actor(Some("sibling"), &ai_memory_core::ActorKey::default())
+                .await,
             (active_ws, sibling_proj),
             "project-only read resolution should use the active workspace"
         );
 
         let result = server
-            .memory_recent(Parameters(RecentArgs {
-                limit: Some(5),
-                project: Some("sibling".to_string()),
-                workspace: None,
-            }))
+            .memory_recent(
+                Parameters(RecentArgs {
+                    limit: Some(5),
+                    project: Some("sibling".to_string()),
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = result
@@ -2158,14 +2386,17 @@ mod tests {
     async fn memory_query_returns_hits_via_tool_method() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let result = server
-            .memory_query(Parameters(QueryArgs {
-                query: "karpathy".into(),
-                limit: Some(5),
-                project: None,
-                scopes: Vec::new(),
-                workspace: None,
-                global: None,
-            }))
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "karpathy".into(),
+                    limit: Some(5),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = match result.content.first().and_then(|c| c.as_text()) {
@@ -2207,14 +2438,17 @@ mod tests {
             .unwrap();
 
         let result = server
-            .memory_query(Parameters(QueryArgs {
-                query: "quokka".into(),
-                limit: Some(5),
-                project: None,
-                scopes: Vec::new(),
-                workspace: None,
-                global: None,
-            }))
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "quokka".into(),
+                    limit: Some(5),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = match result.content.first().and_then(|c| c.as_text()) {
@@ -2263,14 +2497,17 @@ mod tests {
             .unwrap();
 
         let result = server
-            .memory_query(Parameters(QueryArgs {
-                query: "workspace_specific_token".into(),
-                limit: Some(5),
-                project: Some("unit-testing".into()),
-                scopes: Vec::new(),
-                workspace: Some("practice".into()),
-                global: None,
-            }))
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "workspace_specific_token".into(),
+                    limit: Some(5),
+                    project: Some("unit-testing".into()),
+                    scopes: Vec::new(),
+                    workspace: Some("practice".into()),
+                    global: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = result
@@ -2314,12 +2551,15 @@ mod tests {
 
         let result = server
             .with_wiki(wiki)
-            .memory_read_page(Parameters(ReadPageArgs {
-                query: None,
-                path: Some("notes/sibling.md".into()),
-                project: Some("docs".into()),
-                workspace: Some("practice".into()),
-            }))
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("notes/sibling.md".into()),
+                    project: Some("docs".into()),
+                    workspace: Some("practice".into()),
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = result
@@ -2361,12 +2601,15 @@ mod tests {
 
         let result = server
             .with_wiki(wiki)
-            .memory_read_page(Parameters(ReadPageArgs {
-                query: None,
-                path: Some("notes/db-only-tool.md".into()),
-                project: None,
-                workspace: None,
-            }))
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("notes/db-only-tool.md".into()),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = result
@@ -2458,23 +2701,26 @@ mod tests {
             .unwrap();
 
         let result = server
-            .memory_query(Parameters(QueryArgs {
-                query: "multi_scope_token".into(),
-                limit: Some(10),
-                project: None,
-                scopes: vec![
-                    MemoryScopeArg {
-                        project: "product".into(),
-                        workspace: "default".into(),
-                    },
-                    MemoryScopeArg {
-                        project: "unit-testing".into(),
-                        workspace: "practice".into(),
-                    },
-                ],
-                workspace: None,
-                global: None,
-            }))
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "multi_scope_token".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: vec![
+                        MemoryScopeArg {
+                            project: "product".into(),
+                            workspace: "default".into(),
+                        },
+                        MemoryScopeArg {
+                            project: "unit-testing".into(),
+                            workspace: "practice".into(),
+                        },
+                    ],
+                    workspace: None,
+                    global: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = result
@@ -2533,14 +2779,17 @@ mod tests {
         }
 
         let result = server
-            .memory_query(Parameters(QueryArgs {
-                query: "global_token".into(),
-                limit: Some(10),
-                project: None,
-                scopes: Vec::new(),
-                workspace: None,
-                global: Some(true),
-            }))
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "global_token".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: Some(true),
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = result
@@ -2564,14 +2813,17 @@ mod tests {
     async fn memory_query_global_rejects_explicit_scope() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let err = server
-            .memory_query(Parameters(QueryArgs {
-                query: "x".into(),
-                limit: Some(5),
-                project: Some("product".into()),
-                scopes: Vec::new(),
-                workspace: None,
-                global: Some(true),
-            }))
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "x".into(),
+                    limit: Some(5),
+                    project: Some("product".into()),
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: Some(true),
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await;
         assert!(
             err.is_err(),
@@ -2583,10 +2835,13 @@ mod tests {
     async fn memory_status_returns_counts() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let result = server
-            .memory_status(Parameters(StatusArgs {
-                project: None,
-                workspace: None,
-            }))
+            .memory_status(
+                Parameters(StatusArgs {
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = result
@@ -2602,11 +2857,14 @@ mod tests {
     async fn memory_briefing_returns_structured_snapshot() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let result = server
-            .memory_briefing(Parameters(BriefingArgs {
-                recent_pages_limit: Some(5),
-                project: None,
-                workspace: None,
-            }))
+            .memory_briefing(
+                Parameters(BriefingArgs {
+                    recent_pages_limit: Some(5),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = result
@@ -2646,12 +2904,15 @@ mod tests {
     async fn memory_explore_without_llm_degrades_to_briefing() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let result = server
-            .memory_explore(Parameters(ExploreArgs {
-                focus: None,
-                recent_pages_limit: Some(5),
-                project: None,
-                workspace: None,
-            }))
+            .memory_explore(
+                Parameters(ExploreArgs {
+                    focus: None,
+                    recent_pages_limit: Some(5),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = result
@@ -2707,11 +2968,14 @@ mod tests {
     async fn memory_recent_returns_one_hit() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let result = server
-            .memory_recent(Parameters(RecentArgs {
-                limit: Some(5),
-                project: None,
-                workspace: None,
-            }))
+            .memory_recent(
+                Parameters(RecentArgs {
+                    limit: Some(5),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = result
@@ -2776,11 +3040,14 @@ mod tests {
         assert!(text.contains("notes/santander-2025.md"), "got {text}");
 
         let recent = server
-            .memory_recent(Parameters(RecentArgs {
-                limit: Some(5),
-                project: None,
-                workspace: None,
-            }))
+            .memory_recent(
+                Parameters(RecentArgs {
+                    limit: Some(5),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let recent_text = recent
@@ -2853,12 +3120,15 @@ mod tests {
 
         // The on-disk file is gone; reading it back errors (file not found).
         let read = server
-            .memory_read_page(Parameters(ReadPageArgs {
-                query: None,
-                path: Some("notes/temp.md".into()),
-                project: None,
-                workspace: None,
-            }))
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("notes/temp.md".into()),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await;
         assert!(read.is_err(), "deleted page must not be readable");
 
@@ -2866,11 +3136,14 @@ mod tests {
         // does not reconcile deletions, so a file-only delete would leave the
         // page surfacing in recent/search with stale content.
         let recent = server
-            .memory_recent(Parameters(RecentArgs {
-                limit: Some(10),
-                project: None,
-                workspace: None,
-            }))
+            .memory_recent(
+                Parameters(RecentArgs {
+                    limit: Some(10),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let recent_text = recent
@@ -2977,12 +3250,15 @@ mod tests {
 
         // Alpha twin must survive.
         let read_alpha = server
-            .memory_read_page(Parameters(ReadPageArgs {
-                query: None,
-                path: Some("notes/twin.md".into()),
-                project: Some("shared".into()),
-                workspace: Some("alpha".into()),
-            }))
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("notes/twin.md".into()),
+                    project: Some("shared".into()),
+                    workspace: Some("alpha".into()),
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await;
         assert!(
             read_alpha.is_ok(),
@@ -2991,12 +3267,15 @@ mod tests {
 
         // Beta twin must be gone (file-on-disk delete + DB row cleared).
         let read_beta = server
-            .memory_read_page(Parameters(ReadPageArgs {
-                query: None,
-                path: Some("notes/twin.md".into()),
-                project: Some("shared".into()),
-                workspace: Some("beta".into()),
-            }))
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("notes/twin.md".into()),
+                    project: Some("shared".into()),
+                    workspace: Some("beta".into()),
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await;
         assert!(
             read_beta.is_err(),
@@ -3055,11 +3334,14 @@ mod tests {
 
         // Visible in `other` (created), absent from the baked `scratch`.
         let in_other = server
-            .memory_recent(Parameters(RecentArgs {
-                limit: Some(5),
-                project: Some("other".into()),
-                workspace: None,
-            }))
+            .memory_recent(
+                Parameters(RecentArgs {
+                    limit: Some(5),
+                    project: Some("other".into()),
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let other_text = in_other
@@ -3074,11 +3356,14 @@ mod tests {
         );
 
         let in_scratch = server
-            .memory_recent(Parameters(RecentArgs {
-                limit: Some(5),
-                project: None,
-                workspace: None,
-            }))
+            .memory_recent(
+                Parameters(RecentArgs {
+                    limit: Some(5),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let scratch_text = in_scratch
@@ -3107,23 +3392,29 @@ mod tests {
         server.active_project.set(ws, active);
 
         server
-            .memory_handoff_begin(Parameters(HandoffBeginArgs {
-                summary: "fix omp CHECK".into(),
-                open_questions: vec![],
-                next_steps: vec![],
-                files_touched: vec![],
-                cwd: Some(r"C:\GIT\ai-memory".into()),
-                project: None,
-            }))
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "fix omp CHECK".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    cwd: Some(r"C:\GIT\ai-memory".into()),
+                    project: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
 
         let briefing = server
-            .memory_briefing(Parameters(BriefingArgs {
-                recent_pages_limit: Some(5),
-                project: None,
-                workspace: None,
-            }))
+            .memory_briefing(
+                Parameters(BriefingArgs {
+                    recent_pages_limit: Some(5),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let text = briefing
@@ -3142,14 +3433,17 @@ mod tests {
     async fn handoff_begin_then_accept_round_trips() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let begin = server
-            .memory_handoff_begin(Parameters(HandoffBeginArgs {
-                summary: "left mid-refactor of writer actor".into(),
-                open_questions: vec!["what max channel size?".into()],
-                next_steps: vec!["finish supersession path".into()],
-                files_touched: vec!["crates/ai-memory-store/src/writer.rs".into()],
-                cwd: Some("/tmp/aim".into()),
-                project: None,
-            }))
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "left mid-refactor of writer actor".into(),
+                    open_questions: vec!["what max channel size?".into()],
+                    next_steps: vec!["finish supersession path".into()],
+                    files_touched: vec!["crates/ai-memory-store/src/writer.rs".into()],
+                    cwd: Some("/tmp/aim".into()),
+                    project: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let begin_text = begin
@@ -3162,10 +3456,13 @@ mod tests {
 
         // Accepting with matching cwd returns the handoff.
         let accept = server
-            .memory_handoff_accept(Parameters(HandoffAcceptArgs {
-                cwd: Some("/tmp/aim".into()),
-                project: None,
-            }))
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: Some("/tmp/aim".into()),
+                    project: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let accept_text = accept
@@ -3179,10 +3476,13 @@ mod tests {
 
         // Second accept returns null (handoff is now accepted).
         let again = server
-            .memory_handoff_accept(Parameters(HandoffAcceptArgs {
-                cwd: Some("/tmp/aim".into()),
-                project: None,
-            }))
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: Some("/tmp/aim".into()),
+                    project: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let again_text = again
@@ -3198,14 +3498,17 @@ mod tests {
     async fn handoff_cancel_expires_open_handoff_and_clears_briefing_count() {
         let (_tmp, store, server, _ws, _pj) = setup_server().await;
         let begin = server
-            .memory_handoff_begin(Parameters(HandoffBeginArgs {
-                summary: "accidental status summary".into(),
-                open_questions: vec![],
-                next_steps: vec![],
-                files_touched: vec![],
-                cwd: Some("/tmp/aim".into()),
-                project: None,
-            }))
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "accidental status summary".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    cwd: Some("/tmp/aim".into()),
+                    project: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let begin_text = begin
@@ -3218,11 +3521,14 @@ mod tests {
         let handoff_id = begin_json["handoff_id"].as_str().unwrap().to_string();
 
         let before = server
-            .memory_briefing(Parameters(BriefingArgs {
-                recent_pages_limit: Some(5),
-                project: None,
-                workspace: None,
-            }))
+            .memory_briefing(
+                Parameters(BriefingArgs {
+                    recent_pages_limit: Some(5),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let before_text = before
@@ -3234,11 +3540,14 @@ mod tests {
         assert!(before_text.contains("\"pending_handoff_count\": 1"));
 
         let cancel = server
-            .memory_handoff_cancel(Parameters(HandoffCancelArgs {
-                handoff_id: handoff_id.clone(),
-                project: None,
-                workspace: None,
-            }))
+            .memory_handoff_cancel(
+                Parameters(HandoffCancelArgs {
+                    handoff_id: handoff_id.clone(),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let cancel_text = cancel
@@ -3251,11 +3560,14 @@ mod tests {
         assert!(cancel_text.contains("\"state\": \"expired\""));
 
         let after = server
-            .memory_briefing(Parameters(BriefingArgs {
-                recent_pages_limit: Some(5),
-                project: None,
-                workspace: None,
-            }))
+            .memory_briefing(
+                Parameters(BriefingArgs {
+                    recent_pages_limit: Some(5),
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let after_text = after
@@ -3267,10 +3579,13 @@ mod tests {
         assert!(after_text.contains("\"pending_handoff_count\": 0"));
 
         let accept = server
-            .memory_handoff_accept(Parameters(HandoffAcceptArgs {
-                cwd: Some("/tmp/aim".into()),
-                project: None,
-            }))
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: Some("/tmp/aim".into()),
+                    project: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .unwrap();
         let accept_text = accept
@@ -3322,12 +3637,15 @@ mod tests {
     async fn memory_lint_without_wiki_errors_cleanly() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let err = server
-            .memory_lint(Parameters(LintArgs {
-                dry_run: Some(true),
-                no_llm: None,
-                project: None,
-                workspace: None,
-            }))
+            .memory_lint(
+                Parameters(LintArgs {
+                    dry_run: Some(true),
+                    no_llm: None,
+                    project: None,
+                    workspace: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .expect_err("must reject when wiki is not attached");
         let msg = format!("{err:?}");
@@ -3391,7 +3709,13 @@ mod tests {
         let sweep_count = |args: SweepArgs| {
             let server = &server;
             async move {
-                let out = server.memory_forget_sweep(Parameters(args)).await.unwrap();
+                let out = server
+                    .memory_forget_sweep(
+                        Parameters(args),
+                        rmcp::handler::server::tool::Extension(test_parts_default()),
+                    )
+                    .await
+                    .unwrap();
                 let text = out
                     .content
                     .first()
@@ -3435,10 +3759,13 @@ mod tests {
     async fn memory_handoff_accept_when_none_pending_returns_null() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let result = server
-            .memory_handoff_accept(Parameters(HandoffAcceptArgs {
-                cwd: None,
-                project: None,
-            }))
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: None,
+                    project: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .expect("empty-queue must be Ok, not Err");
         let text = result
@@ -3463,14 +3790,17 @@ mod tests {
         // with a sane response. (We don't have 10k pages, so the
         // hit count is small — we just need NOT to error.)
         let result = server
-            .memory_query(Parameters(QueryArgs {
-                query: "Karpathy".into(),
-                limit: Some(99_999),
-                project: None,
-                scopes: Vec::new(),
-                workspace: None,
-                global: None,
-            }))
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "Karpathy".into(),
+                    limit: Some(99_999),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await
             .expect("oversized limit should be clamped, not refused");
         let text = result
@@ -3491,14 +3821,17 @@ mod tests {
     async fn memory_query_malformed_fts5_returns_error() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let err = server
-            .memory_query(Parameters(QueryArgs {
-                query: "\"unbalanced".into(),
-                limit: Some(10),
-                project: None,
-                scopes: Vec::new(),
-                workspace: None,
-                global: None,
-            }))
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "\"unbalanced".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                }),
+                rmcp::handler::server::tool::Extension(test_parts_default()),
+            )
             .await;
         // Either a tidy 0-hit Ok (FTS5 is occasionally lenient) or
         // an Err — both are acceptable. A panic is not.
