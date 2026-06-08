@@ -230,6 +230,23 @@ pub struct ProjectSummary {
     pub last_updated: Option<String>,
 }
 
+/// One `(workspace, project)` scope with the ids + repo_path needed to write
+/// its self-describing `_meta.md` manifest. Returned by
+/// [`ReaderPool::list_all_scopes`]; consumed by `Wiki::backfill_scope_manifests`.
+#[derive(Debug, Clone)]
+pub struct ScopeRow {
+    /// Workspace id — matches the level-1 wiki directory name.
+    pub workspace_id: WorkspaceId,
+    /// Human-readable workspace name.
+    pub workspace_name: String,
+    /// Project id — matches the level-2 wiki directory name.
+    pub project_id: ProjectId,
+    /// Human-readable project name.
+    pub project_name: String,
+    /// Filesystem path the project's cwd-based routing resolves to, if any.
+    pub repo_path: Option<String>,
+}
+
 /// One row per workspace with aggregate stats.
 /// Returned by [`ReaderPool::list_workspaces_with_stats`].
 #[derive(Debug, Clone, Serialize)]
@@ -2463,6 +2480,48 @@ impl ReaderPool {
             Ok(out)
         })
         .await
+    }
+
+    /// Return every `(workspace, project)` scope with its ids, names and
+    /// `repo_path` — the data needed to write each scope's self-describing
+    /// `_meta.md` manifest. Unlike [`list_projects_with_stats`], this carries
+    /// the surrogate ids (not just names), so a rebuild can key the wiki tree.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_all_scopes(&self) -> StoreResult<Vec<ScopeRow>> {
+        // (ws_id, ws_name, proj_id, proj_name, repo_path) as raw SQL columns.
+        type RawScope = (Vec<u8>, String, Vec<u8>, String, Option<String>);
+        let raw: Vec<RawScope> = self
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT w.id, w.name, p.id, p.name, p.repo_path \
+                     FROM projects p JOIN workspaces w ON w.id = p.workspace_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })?;
+                let out: rusqlite::Result<Vec<_>> = rows.collect();
+                Ok(out?)
+            })
+            .await?;
+        raw.into_iter()
+            .map(|(wi, wn, pi, pn, rp)| {
+                Ok(ScopeRow {
+                    workspace_id: WorkspaceId::from_slice(&wi)?,
+                    workspace_name: wn,
+                    project_id: ProjectId::from_slice(&pi)?,
+                    project_name: pn,
+                    repo_path: rp,
+                })
+            })
+            .collect()
     }
 
     /// Return one row per workspace with project/page-count and

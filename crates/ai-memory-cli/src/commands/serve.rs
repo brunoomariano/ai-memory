@@ -96,7 +96,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     // operators discover misconfiguration immediately.
     let sanitizer = Sanitizer::new(&config.sanitize)
         .context("compiling sanitizer.extra_patterns from config")?;
-    let wiki = Wiki::new(&config.data_dir, store.writer.clone())?.with_sanitizer(sanitizer.clone());
+    let wiki = Wiki::new(&config.data_dir, store.writer.clone())?
+        .with_sanitizer(sanitizer.clone())
+        // Reader attached unconditionally: admission name-resolution uses it
+        // when a chain is configured, and the startup scope-manifest backfill
+        // (below) always needs it to enumerate scopes.
+        .with_store_reader(store.reader.clone());
     // Attach the admission webhook chain (operator-configured via
     // `[[admission_webhooks]]` in config.toml or `AI_MEMORY_ADMISSION_WEBHOOKS__N__*`
     // env vars). Empty config = no chain attached, zero overhead. The store
@@ -116,6 +121,15 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     };
     let provider_health = ProviderHealth::default();
     let (wiki, embedder) = configure_embedder(config, &store, wiki, &provider_health).await?;
+
+    // Make the wiki tree self-describing: write each scope's `_meta.md`
+    // (workspace/project name + repo_path) if missing, so the markdown alone
+    // can rebuild the index via `ai-memory reindex`. Idempotent; non-fatal.
+    match wiki.backfill_scope_manifests().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "wrote _meta.md scope manifests"),
+        Err(e) => tracing::warn!(error = %e, "scope-manifest backfill failed (non-fatal)"),
+    }
 
     // Keep the guard alive for the lifetime of `serve`.
     let _watcher = start_watcher(&args, &wiki)?;

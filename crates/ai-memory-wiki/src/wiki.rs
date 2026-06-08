@@ -610,6 +610,59 @@ impl Wiki {
         Ok(summary)
     }
 
+    /// Write a `_meta.md` scope manifest under `dir` from `frontmatter`,
+    /// idempotently — unchanged content is left untouched so a startup
+    /// backfill never churns the wiki git history. Returns `true` if written.
+    fn write_scope_manifest(dir: &Path, frontmatter: serde_json::Value) -> WikiResult<bool> {
+        let content = emit(&Markdown {
+            frontmatter,
+            body: String::new(),
+        })?;
+        let path = dir.join("_meta.md");
+        if std::fs::read_to_string(&path).is_ok_and(|existing| existing == content) {
+            return Ok(false);
+        }
+        std::fs::create_dir_all(dir)?;
+        crate::atomic::write_atomic(&path, content.as_bytes())?;
+        Ok(true)
+    }
+
+    /// Ensure every workspace/project scope has its self-describing `_meta.md`
+    /// manifest on disk (`workspace`/`project` name + `repo_path`), so the wiki
+    /// tree alone is enough to rebuild the index via [`Self::reindex_all`] —
+    /// the "DB is rebuildable from files" guarantee. Idempotent; safe to run on
+    /// every startup. No-op without a store reader. Returns the count written.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] for store or filesystem errors.
+    pub async fn backfill_scope_manifests(&self) -> WikiResult<usize> {
+        let Some(reader) = &self.store_reader else {
+            return Ok(0);
+        };
+        let scopes = reader.list_all_scopes().await?;
+        let mut written = 0;
+        let mut seen_ws = std::collections::HashSet::new();
+        for s in scopes {
+            let ws_dir = self.root().join(s.workspace_id.to_string());
+            if seen_ws.insert(s.workspace_id)
+                && Self::write_scope_manifest(
+                    &ws_dir,
+                    serde_json::json!({ "workspace": s.workspace_name }),
+                )?
+            {
+                written += 1;
+            }
+            let mut fm = serde_json::json!({ "project": s.project_name });
+            if let Some(rp) = s.repo_path {
+                fm["repo_path"] = serde_json::Value::String(rp);
+            }
+            if Self::write_scope_manifest(&ws_dir.join(s.project_id.to_string()), fm)? {
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
     /// Atomically apply a batch of page writes. Either all pages land
     /// (one SQL transaction) and their files are renamed into place,
     /// or no DB row changes and tempfiles are dropped.
@@ -1750,5 +1803,91 @@ mod tests {
             "anonymous writes must NOT add last_modified_by — backward compat"
         );
         assert_eq!(md.frontmatter["title"], "Anon");
+    }
+
+    fn copy_tree(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let to = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &to);
+            } else {
+                std::fs::copy(entry.path(), &to).unwrap();
+            }
+        }
+    }
+
+    /// End-to-end "DB is rebuildable from files": `backfill_scope_manifests`
+    /// makes the wiki self-describing, then `reindex_all` on a FRESH store
+    /// (no DB carried over) recreates the named scopes + all pages from the
+    /// wiki tree alone — including a page that lives at the reserved name
+    /// `log.md` (kept because it has frontmatter).
+    #[tokio::test]
+    async fn backfill_then_reindex_rebuilds_from_wiki_alone() {
+        // Source store: a named scope with two pages (one at `log.md`).
+        let src = TempDir::new().unwrap();
+        let s1 = Store::open(src.path()).unwrap();
+        let ws = s1.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = s1
+            .writer
+            .get_or_create_project(ws, "webapp", Some("/repo/webapp".into()))
+            .await
+            .unwrap();
+        let w1 = Wiki::new(src.path(), s1.writer.clone())
+            .unwrap()
+            .with_store_reader(s1.reader.clone());
+        w1.apply_batch(vec![
+            req(
+                ws,
+                proj,
+                "notes/a.md",
+                "alpha uniquetoken",
+                serde_json::json!({}),
+            ),
+            req(
+                ws,
+                proj,
+                "log.md",
+                "a page that lives at the reserved log name",
+                serde_json::json!({ "title": "Log Page" }),
+            ),
+        ])
+        .await
+        .unwrap();
+
+        // Make the wiki self-describing.
+        let written = w1.backfill_scope_manifests().await.unwrap();
+        assert!(written >= 2, "ws + proj manifests written, got {written}");
+        let ws_dir = src.path().join("wiki").join(ws.to_string());
+        assert!(ws_dir.join("_meta.md").is_file());
+        assert!(ws_dir.join(proj.to_string()).join("_meta.md").is_file());
+        drop(s1);
+
+        // Fresh store; copy ONLY the wiki tree (no db/); rebuild from it.
+        let dst = TempDir::new().unwrap();
+        let s2 = Store::open(dst.path()).unwrap();
+        copy_tree(&src.path().join("wiki"), &dst.path().join("wiki"));
+        let w2 = Wiki::new(dst.path(), s2.writer.clone()).unwrap();
+        let summary = w2.reindex_all().await.unwrap();
+
+        assert_eq!(summary.projects, 1);
+        assert_eq!(summary.pages, 2, "both pages incl. log.md reconstructed");
+        assert_eq!(
+            s2.reader.workspace_name_by_id(ws).await.unwrap().as_deref(),
+            Some("acme"),
+            "workspace name recovered from _meta.md"
+        );
+        let hits = s2
+            .reader
+            .search_pages("uniquetoken".into(), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "reindexed page is searchable in the fresh store"
+        );
+        drop(s2);
     }
 }
