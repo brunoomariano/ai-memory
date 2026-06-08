@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.13.0] - 2026-06-08
 ### Added
 - New `ai-memory reindex` lifecycle command rebuilds the derived SQLite page
   index from the on-disk wiki. It recreates workspace/project rows from
@@ -893,7 +895,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.12.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.13.0
 [0.12.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.12.3
 [0.12.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.12.2
 [0.12.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.12.1
