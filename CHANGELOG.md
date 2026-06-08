@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- New `ai-memory reindex` lifecycle command rebuilds the derived SQLite page
+  index from the on-disk wiki. It recreates workspace/project rows from
+  per-scope `_meta.md` manifests while preserving the UUIDs encoded in the
+  wiki tree, then reindexes page markdown into pages, links, and FTS. The
+  command refuses to run unless the SQLite store is clean; operators should
+  stop the server, back up data, move/remove `db/memory.sqlite`, run
+  `reindex`, and recompute embeddings separately with `embed` when needed.
+- Wiki startup now backfills per-workspace and per-project `_meta.md` manifests
+  containing the human workspace/project names (and `repo_path` for projects)
+  so the markdown tree is self-describing enough to rebuild the derived DB.
+
+### Fixed
+- Wiki reindexing now treats `log.md` / `log-YYYY-MM.md` as raw hook ledgers
+  only when their content opens with the hook log prefix, so ordinary markdown
+  pages with reserved-looking names are no longer silently dropped. `_meta.md`
+  manifests and direct watcher events also reject symlinks before reading.
 
 ## [0.12.3] - 2026-06-07
 

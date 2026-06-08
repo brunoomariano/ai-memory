@@ -29,8 +29,9 @@ pub use ops::{EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
 pub use reader::{
     ActivityWindow, BriefingPage, BriefingSnapshot, DecayCandidate, DerivedIndexStatus,
     EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit, PageAuthor, PageHit,
-    PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool, RelatedPage,
-    ScopeRow, StatusCounts, StoredEmbedding, StoredPageBody, WorkspaceSummary, f32_vec_to_bytes,
+    PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
+    ReindexTargetStatus, RelatedPage, ScopeRow, StatusCounts, StoredEmbedding, StoredPageBody,
+    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use writer::WriterHandle;
@@ -390,6 +391,38 @@ mod tests {
         assert_eq!(counts.pages_all, 0);
         assert_eq!(counts.sessions, 0);
         assert_eq!(counts.observations, 0);
+    }
+
+    #[tokio::test]
+    async fn reindex_target_status_tracks_clean_and_dirty_store() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+
+        let clean = store.reader.reindex_target_status().await.unwrap();
+        assert!(clean.is_clean(), "fresh migrated DB must be reindex-clean");
+
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "alpha.md", "body"))
+            .await
+            .unwrap();
+
+        let dirty = store.reader.reindex_target_status().await.unwrap();
+        assert!(
+            !dirty.is_clean(),
+            "existing rows must block lifecycle reindex"
+        );
+        assert!(dirty.nonzero_summary().contains("pages=1"));
     }
 
     #[tokio::test]

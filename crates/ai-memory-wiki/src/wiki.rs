@@ -421,7 +421,7 @@ impl Wiki {
         let ctx = self
             .admit_purge_project(workspace_id, project_id, admission_ctx)
             .await?;
-        self.remove_project_dir(workspace_id, project_id)?;
+        self.remove_project_dir(workspace_id, project_id).await?;
         self.dispatch_purge_project(ctx.as_ref());
         Ok(())
     }
@@ -454,11 +454,12 @@ impl Wiki {
     ///
     /// # Errors
     /// Returns [`WikiError::Io`] on filesystem errors other than NotFound.
-    pub fn remove_project_dir(
+    pub async fn remove_project_dir(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
     ) -> WikiResult<()> {
+        let _guard = self.mutation_lock.write().await;
         let root = self.project_root(workspace_id, project_id);
         match std::fs::remove_dir_all(&root) {
             Ok(()) => Ok(()),
@@ -526,7 +527,15 @@ impl Wiki {
 
     /// Read a `_meta.md` scope-manifest's frontmatter from `dir`.
     fn read_scope_meta(dir: &Path) -> WikiResult<serde_json::Value> {
-        let raw = std::fs::read_to_string(dir.join("_meta.md"))?;
+        let path = dir.join("_meta.md");
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            return Err(WikiError::Io(std::io::Error::other(format!(
+                "refusing to read symlinked scope manifest {}",
+                path.display()
+            ))));
+        }
+        let raw = std::fs::read_to_string(path)?;
         Ok(parse(&raw)?.frontmatter)
     }
 
@@ -619,8 +628,19 @@ impl Wiki {
             body: String::new(),
         })?;
         let path = dir.join("_meta.md");
-        if std::fs::read_to_string(&path).is_ok_and(|existing| existing == content) {
-            return Ok(false);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(WikiError::Io(std::io::Error::other(format!(
+                    "refusing to update symlinked scope manifest {}",
+                    path.display()
+                ))));
+            }
+            Ok(meta) if meta.is_file() => {
+                if std::fs::read_to_string(&path).is_ok_and(|existing| existing == content) {
+                    return Ok(false);
+                }
+            }
+            Ok(_) | Err(_) => {}
         }
         std::fs::create_dir_all(dir)?;
         crate::atomic::write_atomic(&path, content.as_bytes())?;
@@ -639,19 +659,21 @@ impl Wiki {
         let Some(reader) = &self.store_reader else {
             return Ok(0);
         };
+        let _guard = self.mutation_lock.write().await;
+        let workspaces = reader.list_all_workspace_scopes().await?;
         let scopes = reader.list_all_scopes().await?;
         let mut written = 0;
-        let mut seen_ws = std::collections::HashSet::new();
-        for s in scopes {
-            let ws_dir = self.root().join(s.workspace_id.to_string());
-            if seen_ws.insert(s.workspace_id)
-                && Self::write_scope_manifest(
-                    &ws_dir,
-                    serde_json::json!({ "workspace": s.workspace_name }),
-                )?
-            {
+        for ws in workspaces {
+            let ws_dir = self.root().join(ws.workspace_id.to_string());
+            if Self::write_scope_manifest(
+                &ws_dir,
+                serde_json::json!({ "workspace": ws.workspace_name }),
+            )? {
                 written += 1;
             }
+        }
+        for s in scopes {
+            let ws_dir = self.root().join(s.workspace_id.to_string());
             let mut fm = serde_json::json!({ "project": s.project_name });
             if let Some(rp) = s.repo_path {
                 fm["repo_path"] = serde_json::Value::String(rp);
@@ -1889,5 +1911,59 @@ mod tests {
             "reindexed page is searchable in the fresh store"
         );
         drop(s2);
+    }
+
+    #[tokio::test]
+    async fn backfill_writes_manifest_for_empty_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("empty-ws")
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+
+        let written = wiki.backfill_scope_manifests().await.unwrap();
+
+        assert_eq!(written, 1);
+        let meta = std::fs::read_to_string(
+            tmp.path()
+                .join("wiki")
+                .join(ws.to_string())
+                .join("_meta.md"),
+        )
+        .unwrap();
+        assert!(meta.contains("workspace: empty-ws"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn reindex_rejects_symlinked_scope_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let proj_dir = ws_dir.join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(ws_dir.join("_meta.md"), "---\nworkspace: acme\n---\n").unwrap();
+
+        let outside = tmp.path().join("outside-meta.md");
+        std::fs::write(&outside, "---\nproject: webapp\n---\n").unwrap();
+        let link = proj_dir.join("_meta.md");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside, &link).unwrap();
+
+        let err = wiki.reindex_all().await.unwrap_err();
+        assert!(
+            err.to_string().contains("symlinked scope manifest"),
+            "reindex must reject symlinked manifests, got {err:#}"
+        );
     }
 }

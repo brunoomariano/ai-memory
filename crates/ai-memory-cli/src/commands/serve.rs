@@ -117,7 +117,6 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             "admission webhook chain attached"
         );
         wiki.with_admission_chain(chain)
-            .with_store_reader(store.reader.clone())
     };
     let provider_health = ProviderHealth::default();
     let (wiki, embedder) = configure_embedder(config, &store, wiki, &provider_health).await?;

@@ -110,6 +110,73 @@ pub struct StatusCounts {
     pub observations: u64,
 }
 
+/// Counts that must all be zero before `ai-memory reindex` rebuilds the
+/// derived SQLite store from wiki files.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReindexTargetStatus {
+    /// Workspace rows already present in SQLite.
+    pub workspaces: u64,
+    /// Project rows already present in SQLite.
+    pub projects: u64,
+    /// Page rows, including superseded versions.
+    pub pages: u64,
+    /// Link rows derived from latest page bodies.
+    pub links: u64,
+    /// Stored embedding rows derived from latest pages.
+    pub page_embeddings: u64,
+    /// Session rows. These are DB-only episodic state and are not rebuilt.
+    pub sessions: u64,
+    /// Observation rows. These are DB-only episodic state and are not rebuilt.
+    pub observations: u64,
+    /// Handoff rows. These are DB-only episodic state and are not rebuilt.
+    pub handoffs: u64,
+    /// User rows and token hashes. These are DB-only state and are not rebuilt.
+    pub users: u64,
+    /// Audit rows. These are DB-only state and are not rebuilt.
+    pub audit_log: u64,
+}
+
+impl ReindexTargetStatus {
+    /// True when the store has no user data or derived rows.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.workspaces == 0
+            && self.projects == 0
+            && self.pages == 0
+            && self.links == 0
+            && self.page_embeddings == 0
+            && self.sessions == 0
+            && self.observations == 0
+            && self.handoffs == 0
+            && self.users == 0
+            && self.audit_log == 0
+    }
+
+    /// Render a compact list of non-zero counters for operator errors.
+    #[must_use]
+    pub fn nonzero_summary(&self) -> String {
+        let mut parts = Vec::new();
+        macro_rules! push_nonzero {
+            ($field:ident) => {
+                if self.$field != 0 {
+                    parts.push(format!("{}={}", stringify!($field), self.$field));
+                }
+            };
+        }
+        push_nonzero!(workspaces);
+        push_nonzero!(projects);
+        push_nonzero!(pages);
+        push_nonzero!(links);
+        push_nonzero!(page_embeddings);
+        push_nonzero!(sessions);
+        push_nonzero!(observations);
+        push_nonzero!(handoffs);
+        push_nonzero!(users);
+        push_nonzero!(audit_log);
+        parts.join(", ")
+    }
+}
+
 /// Derived-index health counters surfaced by admin status.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DerivedIndexStatus {
@@ -228,6 +295,17 @@ pub struct ProjectSummary {
     /// ISO-8601 timestamp of the newest `updated_at`, or `None` when
     /// the project has no pages yet.
     pub last_updated: Option<String>,
+}
+
+/// One workspace scope with the id + name needed to write its
+/// self-describing `_meta.md` manifest. Returned by
+/// [`ReaderPool::list_all_workspace_scopes`].
+#[derive(Debug, Clone)]
+pub struct WorkspaceScopeRow {
+    /// Workspace id — matches the level-1 wiki directory name.
+    pub workspace_id: WorkspaceId,
+    /// Human-readable workspace name.
+    pub workspace_name: String,
 }
 
 /// One `(workspace, project)` scope with the ids + repo_path needed to write
@@ -2522,6 +2600,72 @@ impl ReaderPool {
                 })
             })
             .collect()
+    }
+
+    /// Return every workspace with its id and name so manifest backfill can
+    /// describe even empty workspaces that have no project rows yet.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_all_workspace_scopes(&self) -> StoreResult<Vec<WorkspaceScopeRow>> {
+        let raw: Vec<(Vec<u8>, String)> = self
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT id, name FROM workspaces")?;
+                let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let out: rusqlite::Result<Vec<_>> = rows.collect();
+                Ok(out?)
+            })
+            .await?;
+        raw.into_iter()
+            .map(|(wi, wn)| {
+                Ok(WorkspaceScopeRow {
+                    workspace_id: WorkspaceId::from_slice(&wi)?,
+                    workspace_name: wn,
+                })
+            })
+            .collect()
+    }
+
+    /// Return counts that must be zero before `ai-memory reindex` runs.
+    ///
+    /// `reindex` is a rebuild-from-files operation, not an in-place repair of a
+    /// dirty DB. If rows already exist, stale derived rows or DB-only episodic
+    /// state could survive and contradict the "rebuilt from wiki" contract.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn reindex_target_status(&self) -> StoreResult<ReindexTargetStatus> {
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT \
+                    (SELECT COUNT(*) FROM workspaces), \
+                    (SELECT COUNT(*) FROM projects), \
+                    (SELECT COUNT(*) FROM pages), \
+                    (SELECT COUNT(*) FROM links), \
+                    (SELECT COUNT(*) FROM page_embeddings), \
+                    (SELECT COUNT(*) FROM sessions), \
+                    (SELECT COUNT(*) FROM observations), \
+                    (SELECT COUNT(*) FROM handoffs), \
+                    (SELECT COUNT(*) FROM users), \
+                    (SELECT COUNT(*) FROM audit_log)",
+                [],
+                |row| {
+                    Ok(ReindexTargetStatus {
+                        workspaces: row.get(0)?,
+                        projects: row.get(1)?,
+                        pages: row.get(2)?,
+                        links: row.get(3)?,
+                        page_embeddings: row.get(4)?,
+                        sessions: row.get(5)?,
+                        observations: row.get(6)?,
+                        handoffs: row.get(7)?,
+                        users: row.get(8)?,
+                        audit_log: row.get(9)?,
+                    })
+                },
+            )?)
+        })
+        .await
     }
 
     /// Return one row per workspace with project/page-count and

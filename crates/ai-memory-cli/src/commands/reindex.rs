@@ -39,6 +39,23 @@ pub async fn run(config: &Config, _args: ReindexArgs) -> Result<()> {
     }
 
     let store = Store::open(&config.data_dir).context("opening store for reindex")?;
+    let target = store
+        .reader
+        .reindex_target_status()
+        .await
+        .context("checking whether the SQLite store is clean for reindex")?;
+    if !target.is_clean() {
+        bail!(
+            "refusing to reindex into a non-empty SQLite store ({counts}). \
+             `ai-memory reindex` rebuilds a clean derived DB from wiki files; \
+             it is not an in-place dirty-index repair. Stop the server, take a \
+             backup, move or remove {db_path}, then re-run reindex. DB-only \
+             state (sessions, observations, handoffs, users, audit rows, \
+             embeddings, decay counters) is not reconstructed from markdown.",
+            counts = target.nonzero_summary(),
+            db_path = store.db_path().display(),
+        );
+    }
     let wiki = Wiki::new(&config.data_dir, store.writer.clone())
         .context("opening wiki")?
         // Reindex is index-rebuild only; embeddings are recomputed separately
@@ -63,4 +80,56 @@ pub async fn run(config: &Config, _args: ReindexArgs) -> Result<()> {
         config.data_dir.join("wiki").display(),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_memory_core::{NewPage, PagePath, Tier};
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn reindex_refuses_dirty_store() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/stale.md").unwrap(),
+                title: "stale".into(),
+                body: "stale body".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        drop(store);
+
+        let err = run(&config, ReindexArgs {}).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing to reindex into a non-empty SQLite store"),
+            "dirty DB must be rejected, got {err:#}"
+        );
+    }
 }

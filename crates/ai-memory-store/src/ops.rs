@@ -158,6 +158,22 @@ pub fn ensure_workspace_with_id(
          ON CONFLICT(id) DO NOTHING",
         params![id.as_bytes(), name, Timestamp::now().as_microsecond()],
     )?;
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT name FROM workspaces WHERE id = ?1",
+            params![id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match existing {
+        Some(existing) if existing == name => Ok(()),
+        Some(existing) => Err(StoreError::Duplicate(format!(
+            "workspace id {id} already exists as name '{existing}', not manifest name '{name}'"
+        ))),
+        None => Err(StoreError::NotFound(format!(
+            "workspace id {id} was not inserted"
+        ))),
+    }?;
     Ok(())
 }
 
@@ -181,6 +197,32 @@ pub fn ensure_project_with_id(
             Timestamp::now().as_microsecond()
         ],
     )?;
+    type ProjectRow = (Vec<u8>, String, Option<String>);
+    let existing: Option<ProjectRow> = conn
+        .query_row(
+            "SELECT workspace_id, name, repo_path FROM projects WHERE id = ?1",
+            params![id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    match existing {
+        Some((existing_ws, existing_name, existing_repo_path))
+            if existing_ws.as_slice() == workspace_id.as_bytes()
+                && existing_name == name
+                && existing_repo_path.as_deref() == repo_path =>
+        {
+            Ok(())
+        }
+        Some((existing_ws, existing_name, existing_repo_path)) => {
+            Err(StoreError::Duplicate(format!(
+                "project id {id} already exists with workspace_id bytes length {}, name='{existing_name}', repo_path={existing_repo_path:?}; manifest has workspace={workspace_id}, name='{name}', repo_path={repo_path:?}",
+                existing_ws.len(),
+            )))
+        }
+        None => Err(StoreError::NotFound(format!(
+            "project id {id} was not inserted"
+        ))),
+    }?;
     Ok(())
 }
 
@@ -1245,7 +1287,7 @@ mod tests {
     //! one-line diff instead of a cascading e2e failure.
     use super::*;
     use ai_memory_core::{
-        LinkTarget, NewHandoff, NewPage, NewSession, PagePath, Tier, WorkspaceId,
+        LinkTarget, NewHandoff, NewPage, NewSession, PagePath, ProjectId, Tier, WorkspaceId,
     };
     use rusqlite::Connection;
     use tempfile::TempDir;
@@ -2147,6 +2189,35 @@ mod tests {
                 Err(StoreError::NotFound(_))
             ),
             "a stale workspace/project pair must fail before wiki writes touch disk"
+        );
+    }
+
+    #[test]
+    fn ensure_workspace_with_id_rejects_id_name_mismatch() {
+        let (_tmp, mut conn, _ws, _proj) = fresh_db();
+        let id = WorkspaceId::new();
+
+        ensure_workspace_with_id(&mut conn, id, "from-manifest").unwrap();
+        let err = ensure_workspace_with_id(&mut conn, id, "other-name").unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::Duplicate(_)),
+            "same workspace id with different name must fail loudly; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_project_with_id_rejects_existing_id_mismatch() {
+        let (_tmp, mut conn, ws, _proj) = fresh_db();
+        let id = ProjectId::new();
+
+        ensure_project_with_id(&mut conn, id, ws, "from-manifest", Some("/repo/a")).unwrap();
+        let err =
+            ensure_project_with_id(&mut conn, id, ws, "renamed", Some("/repo/a")).unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::Duplicate(_)),
+            "same project id with different manifest data must fail loudly; got {err:?}"
         );
     }
 
