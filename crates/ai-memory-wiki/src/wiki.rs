@@ -10,9 +10,20 @@ use tokio::sync::RwLock;
 
 use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
 use crate::atomic;
-use crate::error::WikiResult;
+use crate::error::{WikiError, WikiResult};
 use crate::git::GitAdapter;
 use crate::markdown::{Markdown, derive_title, emit, extract_links, parse};
+
+/// Summary of a [`Wiki::reindex_all`] run.
+#[derive(Debug, Default, Clone)]
+pub struct ReindexSummary {
+    /// Workspaces recreated from `_meta.md`.
+    pub workspaces: usize,
+    /// Projects recreated from `_meta.md`.
+    pub projects: usize,
+    /// Pages reindexed from the wiki tree.
+    pub pages: usize,
+}
 
 /// Wiki filesystem handle.
 ///
@@ -410,7 +421,7 @@ impl Wiki {
         let ctx = self
             .admit_purge_project(workspace_id, project_id, admission_ctx)
             .await?;
-        self.remove_project_dir(workspace_id, project_id)?;
+        self.remove_project_dir(workspace_id, project_id).await?;
         self.dispatch_purge_project(ctx.as_ref());
         Ok(())
     }
@@ -443,11 +454,12 @@ impl Wiki {
     ///
     /// # Errors
     /// Returns [`WikiError::Io`] on filesystem errors other than NotFound.
-    pub fn remove_project_dir(
+    pub async fn remove_project_dir(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
     ) -> WikiResult<()> {
+        let _guard = self.mutation_lock.write().await;
         let root = self.project_root(workspace_id, project_id);
         match std::fs::remove_dir_all(&root) {
             Ok(()) => Ok(()),
@@ -511,6 +523,166 @@ impl Wiki {
             })
             .await?;
         Ok(id)
+    }
+
+    /// Read a `_meta.md` scope-manifest's frontmatter from `dir`.
+    fn read_scope_meta(dir: &Path) -> WikiResult<serde_json::Value> {
+        let path = dir.join("_meta.md");
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            return Err(WikiError::Io(std::io::Error::other(format!(
+                "refusing to read symlinked scope manifest {}",
+                path.display()
+            ))));
+        }
+        let raw = std::fs::read_to_string(path)?;
+        Ok(parse(&raw)?.frontmatter)
+    }
+
+    /// Rebuild the **entire** store index from the on-disk wiki tree — the
+    /// "DB is rebuildable from files" guarantee made concrete. Walks every
+    /// `<ws-uuid>/<proj-uuid>/` directory, recreates the workspace/project rows
+    /// from each dir's self-describing `_meta.md` manifest (preserving the ids
+    /// the tree is keyed by, via [`WriterHandle::ensure_workspace_with_id`] /
+    /// [`ensure_project_with_id`]), then reindexes every page. Pages are
+    /// detected by content (a frontmatter file named `log.md` is a page; the
+    /// raw `## [..]` ledger, `_meta.md` and `bootstrap.md` are skipped).
+    ///
+    /// Intended for a freshly-migrated (clean) store, e.g. to move a data dir
+    /// onto a different migration lineage without carrying the old
+    /// `refinery_schema_history`. DB-only episodic state (sessions,
+    /// observations, handoffs, decay counters) is NOT reconstructed — it is not
+    /// in the markdown; embeddings can be recomputed separately via `embed`.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] for filesystem/parse/store errors, including a
+    /// scope directory that lacks its `_meta.md` (the wiki is not
+    /// self-describing — newer engines write the manifest on scope creation).
+    pub async fn reindex_all(&self) -> WikiResult<ReindexSummary> {
+        let root = self.root().to_path_buf();
+        let project_dirs =
+            tokio::task::spawn_blocking(move || crate::watcher::walk_project_dirs(&root))
+                .await
+                .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
+
+        let mut summary = ReindexSummary::default();
+        let mut seen_ws = std::collections::HashSet::new();
+
+        for (ws, proj, proj_root) in project_dirs {
+            if seen_ws.insert(ws) {
+                let ws_dir = proj_root
+                    .parent()
+                    .unwrap_or(proj_root.as_path())
+                    .to_path_buf();
+                let meta = Self::read_scope_meta(&ws_dir)?;
+                let name = meta
+                    .get("workspace")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WikiError::Io(std::io::Error::other(format!(
+                            "{}/_meta.md is missing the `workspace` name",
+                            ws_dir.display()
+                        )))
+                    })?;
+                self.writer.ensure_workspace_with_id(ws, name).await?;
+                summary.workspaces += 1;
+            }
+
+            let meta = Self::read_scope_meta(&proj_root)?;
+            let name = meta
+                .get("project")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    WikiError::Io(std::io::Error::other(format!(
+                        "{}/_meta.md is missing the `project` name",
+                        proj_root.display()
+                    )))
+                })?;
+            let repo_path = meta
+                .get("repo_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            self.writer
+                .ensure_project_with_id(proj, ws, name, repo_path)
+                .await?;
+            summary.projects += 1;
+
+            let pr = proj_root.clone();
+            let pages = tokio::task::spawn_blocking(move || crate::watcher::walk_markdown(&pr))
+                .await
+                .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
+            for path in pages {
+                self.reindex_page(ws, proj, path).await?;
+                summary.pages += 1;
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Write a `_meta.md` scope manifest under `dir` from `frontmatter`,
+    /// idempotently — unchanged content is left untouched so a startup
+    /// backfill never churns the wiki git history. Returns `true` if written.
+    fn write_scope_manifest(dir: &Path, frontmatter: serde_json::Value) -> WikiResult<bool> {
+        let content = emit(&Markdown {
+            frontmatter,
+            body: String::new(),
+        })?;
+        let path = dir.join("_meta.md");
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(WikiError::Io(std::io::Error::other(format!(
+                    "refusing to update symlinked scope manifest {}",
+                    path.display()
+                ))));
+            }
+            Ok(meta) if meta.is_file() => {
+                if std::fs::read_to_string(&path).is_ok_and(|existing| existing == content) {
+                    return Ok(false);
+                }
+            }
+            Ok(_) | Err(_) => {}
+        }
+        std::fs::create_dir_all(dir)?;
+        crate::atomic::write_atomic(&path, content.as_bytes())?;
+        Ok(true)
+    }
+
+    /// Ensure every workspace/project scope has its self-describing `_meta.md`
+    /// manifest on disk (`workspace`/`project` name + `repo_path`), so the wiki
+    /// tree alone is enough to rebuild the index via [`Self::reindex_all`] —
+    /// the "DB is rebuildable from files" guarantee. Idempotent; safe to run on
+    /// every startup. No-op without a store reader. Returns the count written.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] for store or filesystem errors.
+    pub async fn backfill_scope_manifests(&self) -> WikiResult<usize> {
+        let Some(reader) = &self.store_reader else {
+            return Ok(0);
+        };
+        let _guard = self.mutation_lock.write().await;
+        let workspaces = reader.list_all_workspace_scopes().await?;
+        let scopes = reader.list_all_scopes().await?;
+        let mut written = 0;
+        for ws in workspaces {
+            let ws_dir = self.root().join(ws.workspace_id.to_string());
+            if Self::write_scope_manifest(
+                &ws_dir,
+                serde_json::json!({ "workspace": ws.workspace_name }),
+            )? {
+                written += 1;
+            }
+        }
+        for s in scopes {
+            let ws_dir = self.root().join(s.workspace_id.to_string());
+            let mut fm = serde_json::json!({ "project": s.project_name });
+            if let Some(rp) = s.repo_path {
+                fm["repo_path"] = serde_json::Value::String(rp);
+            }
+            if Self::write_scope_manifest(&ws_dir.join(s.project_id.to_string()), fm)? {
+                written += 1;
+            }
+        }
+        Ok(written)
     }
 
     /// Atomically apply a batch of page writes. Either all pages land
@@ -1653,5 +1825,145 @@ mod tests {
             "anonymous writes must NOT add last_modified_by — backward compat"
         );
         assert_eq!(md.frontmatter["title"], "Anon");
+    }
+
+    fn copy_tree(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let to = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &to);
+            } else {
+                std::fs::copy(entry.path(), &to).unwrap();
+            }
+        }
+    }
+
+    /// End-to-end "DB is rebuildable from files": `backfill_scope_manifests`
+    /// makes the wiki self-describing, then `reindex_all` on a FRESH store
+    /// (no DB carried over) recreates the named scopes + all pages from the
+    /// wiki tree alone — including a page that lives at the reserved name
+    /// `log.md` (kept because it has frontmatter).
+    #[tokio::test]
+    async fn backfill_then_reindex_rebuilds_from_wiki_alone() {
+        // Source store: a named scope with two pages (one at `log.md`).
+        let src = TempDir::new().unwrap();
+        let s1 = Store::open(src.path()).unwrap();
+        let ws = s1.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = s1
+            .writer
+            .get_or_create_project(ws, "webapp", Some("/repo/webapp".into()))
+            .await
+            .unwrap();
+        let w1 = Wiki::new(src.path(), s1.writer.clone())
+            .unwrap()
+            .with_store_reader(s1.reader.clone());
+        w1.apply_batch(vec![
+            req(
+                ws,
+                proj,
+                "notes/a.md",
+                "alpha uniquetoken",
+                serde_json::json!({}),
+            ),
+            req(
+                ws,
+                proj,
+                "log.md",
+                "a page that lives at the reserved log name",
+                serde_json::json!({ "title": "Log Page" }),
+            ),
+        ])
+        .await
+        .unwrap();
+
+        // Make the wiki self-describing.
+        let written = w1.backfill_scope_manifests().await.unwrap();
+        assert!(written >= 2, "ws + proj manifests written, got {written}");
+        let ws_dir = src.path().join("wiki").join(ws.to_string());
+        assert!(ws_dir.join("_meta.md").is_file());
+        assert!(ws_dir.join(proj.to_string()).join("_meta.md").is_file());
+        drop(s1);
+
+        // Fresh store; copy ONLY the wiki tree (no db/); rebuild from it.
+        let dst = TempDir::new().unwrap();
+        let s2 = Store::open(dst.path()).unwrap();
+        copy_tree(&src.path().join("wiki"), &dst.path().join("wiki"));
+        let w2 = Wiki::new(dst.path(), s2.writer.clone()).unwrap();
+        let summary = w2.reindex_all().await.unwrap();
+
+        assert_eq!(summary.projects, 1);
+        assert_eq!(summary.pages, 2, "both pages incl. log.md reconstructed");
+        assert_eq!(
+            s2.reader.workspace_name_by_id(ws).await.unwrap().as_deref(),
+            Some("acme"),
+            "workspace name recovered from _meta.md"
+        );
+        let hits = s2
+            .reader
+            .search_pages("uniquetoken".into(), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "reindexed page is searchable in the fresh store"
+        );
+        drop(s2);
+    }
+
+    #[tokio::test]
+    async fn backfill_writes_manifest_for_empty_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("empty-ws")
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+
+        let written = wiki.backfill_scope_manifests().await.unwrap();
+
+        assert_eq!(written, 1);
+        let meta = std::fs::read_to_string(
+            tmp.path()
+                .join("wiki")
+                .join(ws.to_string())
+                .join("_meta.md"),
+        )
+        .unwrap();
+        assert!(meta.contains("workspace: empty-ws"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn reindex_rejects_symlinked_scope_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let proj_dir = ws_dir.join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(ws_dir.join("_meta.md"), "---\nworkspace: acme\n---\n").unwrap();
+
+        let outside = tmp.path().join("outside-meta.md");
+        std::fs::write(&outside, "---\nproject: webapp\n---\n").unwrap();
+        let link = proj_dir.join("_meta.md");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside, &link).unwrap();
+
+        let err = wiki.reindex_all().await.unwrap_err();
+        assert!(
+            err.to_string().contains("symlinked scope manifest"),
+            "reindex must reject symlinked manifests, got {err:#}"
+        );
     }
 }

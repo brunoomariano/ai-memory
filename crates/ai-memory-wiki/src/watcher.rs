@@ -8,7 +8,8 @@
 //!    Own-writes are absorbed by the store's sha256 short-circuit, so
 //!    the loop terminates after one no-op reindex.
 //! 2. **Reconciliation tick** every 30s walks the entire wiki tree and
-//!    reindexes every markdown file. Catches any events the OS dropped
+//!    reindexes page markdown files (excluding `_meta.md`, bootstrap files,
+//!    raw event ledgers, and symlinks). Catches any events the OS dropped
 //!    (basic-memory #580 — file watchers go stale under FSEvents buffer
 //!    overflow, hidden-dir globs, etc.). Hidden-directory paths are
 //!    explicitly NOT skipped (#798 lesson).
@@ -203,11 +204,22 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         return;
     }
     for raw_path in &event.paths {
-        if raw_path.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(raw_path) else {
+            // Likely a transient state (mv, atomic rename in flight).
+            continue;
+        };
+        let ft = metadata.file_type();
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
             let Some((ws, proj, proj_root)) = extract_project_dir_ids(wiki.root(), raw_path) else {
                 continue;
             };
             reindex_project_dir(wiki, ws, proj, proj_root).await;
+            continue;
+        }
+        if !ft.is_file() {
             continue;
         }
         if !is_markdown(raw_path) {
@@ -219,11 +231,7 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         let Some((ws, proj, page_path)) = extract_project_ids(wiki.root(), raw_path) else {
             continue;
         };
-        if is_reserved_filename(&page_path) {
-            continue;
-        }
-        if !raw_path.is_file() {
-            // Likely a transient state (mv, atomic rename in flight).
+        if is_reserved_page_file(raw_path, &page_path) {
             continue;
         }
         match wiki.reindex_page(ws, proj, page_path.clone()).await {
@@ -284,7 +292,7 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<()> {
 
 /// Walk `<wiki_root>` and return all `(WorkspaceId, ProjectId, proj_root)` tuples
 /// whose first two path segments parse as valid UUIDs.
-fn walk_project_dirs(
+pub(crate) fn walk_project_dirs(
     wiki_root: &Path,
 ) -> WikiResult<Vec<(WorkspaceId, ProjectId, std::path::PathBuf)>> {
     let mut out = Vec::new();
@@ -376,7 +384,7 @@ fn extract_project_dir_ids(
     Some((ws_id, proj_id, wiki_root.join(ws_seg).join(proj_seg)))
 }
 
-fn walk_markdown(root: &Path) -> WikiResult<Vec<PagePath>> {
+pub(crate) fn walk_markdown(root: &Path) -> WikiResult<Vec<PagePath>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -404,7 +412,7 @@ fn walk_markdown(root: &Path) -> WikiResult<Vec<PagePath>> {
                 && is_markdown(&path)
                 && !is_tempfile(&path)
                 && let Some(pp) = page_path_relative_to(root, &path)
-                && !is_reserved_filename(&pp)
+                && !is_reserved_page_file(&path, &pp)
             {
                 out.push(pp);
             }
@@ -423,19 +431,75 @@ fn is_tempfile(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with(".ai-memory-tmp."))
 }
 
-/// Returns `true` for the per-project reserved files that are NOT wiki
-/// pages: `log-YYYY-MM.md` (per-month rolling event ledger — see
-/// `ai-memory-hooks::log::log_filename_for`), the legacy `log.md`
-/// filename for backwards compatibility, and `bootstrap.md` (manifest).
-/// The watcher must skip them to avoid supersession loops — every
-/// `append_event` write triggers a watcher event, triggering an
-/// `upsert_page`, creating a spurious new supersession version.
-fn is_reserved_filename(page_path: &PagePath) -> bool {
+/// `_meta.md` is the per-scope manifest the engine writes (workspace/project
+/// name + repo_path) so the wiki tree is self-describing. It describes the
+/// scope, it is never a wiki page.
+fn is_manifest_filename(page_path: &PagePath) -> bool {
+    page_path
+        .as_str()
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == "_meta.md")
+}
+
+/// `log.md` / `log-YYYY-MM.md` are the raw per-project event ledger the hooks
+/// append to (see `ai-memory-hooks::log::log_filename_for`): `## [ts] ...`
+/// entries, never YAML frontmatter.
+fn is_log_ledger_filename(page_path: &PagePath) -> bool {
     let s = page_path.as_str();
-    s == "log.md"
-        || s == "bootstrap.md"
-        // log-YYYY-MM.md — 7 chars between the dash and the dot.
-        || (s.starts_with("log-") && s.ends_with(".md") && s.len() == "log-YYYY-MM.md".len())
+    s == "log.md" || is_rotated_log_filename(s)
+}
+
+fn is_rotated_log_filename(s: &str) -> bool {
+    let Some(stem) = s.strip_prefix("log-").and_then(|v| v.strip_suffix(".md")) else {
+        return false;
+    };
+    let bytes = stem.as_bytes();
+    bytes.len() == "YYYY-MM".len()
+        && bytes[4] == b'-'
+        && bytes[..4].iter().all(|b| b.is_ascii_digit())
+        && bytes[5..].iter().all(|b| b.is_ascii_digit())
+}
+
+/// Cheap peek: does the file open with a `---` YAML frontmatter fence?
+/// Used to tell a real page apart from the raw event ledger.
+fn opens_with_frontmatter(abs: &Path) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = std::fs::File::open(abs) else {
+        return false;
+    };
+    let mut line = String::new();
+    BufReader::new(file).read_line(&mut line).is_ok() && line.trim_end() == "---"
+}
+
+/// Cheap check for the raw hook event ledger shape. Real page markdown can be
+/// frontmatter-free; a reserved-looking filename is only a ledger when the
+/// content starts with the hook log prefix.
+fn opens_with_log_ledger(abs: &Path) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = std::fs::File::open(abs) else {
+        return false;
+    };
+    let mut line = String::new();
+    BufReader::new(file)
+        .read_line(&mut line)
+        .is_ok_and(|_| line.starts_with("## ["))
+}
+
+/// Returns `true` for markdown files that are NOT wiki pages and must be
+/// skipped by the indexer:
+/// - `_meta.md` (the self-describing scope manifest) and `bootstrap.md` —
+///   always; and
+/// - the raw event ledger (`log.md` / exact `log-YYYY-MM.md`) — skipping which
+///   avoids supersession loops, since every `append_event` write triggers a
+///   watcher event. A reserved-looking filename is skipped only when its
+///   content opens with the raw hook log prefix; ordinary markdown pages with
+///   those names are indexed.
+fn is_reserved_page_file(abs: &Path, page_path: &PagePath) -> bool {
+    if is_manifest_filename(page_path) || page_path.as_str() == "bootstrap.md" {
+        return true;
+    }
+    is_log_ledger_filename(page_path) && !opens_with_frontmatter(abs) && opens_with_log_ledger(abs)
 }
 
 fn page_path_relative_to(root: &Path, abs: &Path) -> Option<PagePath> {
@@ -669,10 +733,19 @@ mod tests {
         // Single-word unique tokens so FTS5 (which parses hyphens as
         // operators) can match them.
         std::fs::write(proj_dir.join("real.md"), "real content\n").unwrap();
-        std::fs::write(proj_dir.join("log.md"), "sessionstarted logtoken unique\n").unwrap();
+        std::fs::write(
+            proj_dir.join("log.md"),
+            "## [2026-06-08T12:34:56Z] session-start | logtoken unique\n",
+        )
+        .unwrap();
         std::fs::write(
             proj_dir.join("log-2026-05.md"),
-            "sessionstarted rotatedlogtoken unique\n",
+            "## [2026-05-01T00:00:00Z] user-prompt | rotatedlogtoken unique\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj_dir.join("log-summary.md"),
+            "ordinary markdown summaries regularlogtoken unique\n",
         )
         .unwrap();
         std::fs::write(
@@ -712,12 +785,98 @@ mod tests {
             "log-YYYY-MM.md (rotated) must not be indexed"
         );
 
+        let regular_hits = store
+            .reader
+            .search_pages("regularlogtoken".into(), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            regular_hits.len(),
+            1,
+            "ordinary log-looking markdown must still be indexed"
+        );
+        assert_eq!(regular_hits[0].path.as_str(), "log-summary.md");
+
         let boot_hits = store
             .reader
             .search_pages("boottoken".into(), 5)
             .await
             .unwrap();
         assert!(boot_hits.is_empty(), "bootstrap.md must not be indexed");
+
+        handle.shutdown().await;
+        drop(store);
+    }
+
+    /// A page that *collides* with a reserved ledger name (`log.md`) but
+    /// carries YAML frontmatter is a real page and MUST be indexed — not
+    /// silently dropped. Regression for a prod data anomaly (a page lived at
+    /// `log.md`) that a filename-only skip would lose on every reindex. The
+    /// `_meta.md` manifest, by contrast, must NEVER be indexed even though it
+    /// also has frontmatter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reindex_page_by_content_not_filename() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        let proj_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+
+        // A genuine page that happens to live at `log.md` (has frontmatter).
+        std::fs::write(
+            proj_dir.join("log.md"),
+            "---\ntitle: Collides With Ledger\n---\nframmaticpage uniquetoken\n",
+        )
+        .unwrap();
+        // The self-describing manifest — never a page, even with frontmatter.
+        std::fs::write(
+            proj_dir.join("_meta.md"),
+            "---\nworkspace: default\nproject: scratch\n---\nmanifesttoken here\n",
+        )
+        .unwrap();
+        // A raw ledger (no frontmatter) — still skipped.
+        std::fs::write(
+            proj_dir.join("log-2026-06.md"),
+            "## [t] evt | x\nrawledgertoken\n",
+        )
+        .unwrap();
+
+        let handle = WatcherHandle::start(wiki.clone()).unwrap();
+        reconcile(&wiki).await.unwrap();
+
+        let page_hits = store
+            .reader
+            .search_pages("uniquetoken".into(), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            page_hits.len(),
+            1,
+            "frontmatter page named log.md must be indexed"
+        );
+        assert_eq!(page_hits[0].path.as_str(), "log.md");
+
+        let meta_hits = store
+            .reader
+            .search_pages("manifesttoken".into(), 5)
+            .await
+            .unwrap();
+        assert!(
+            meta_hits.is_empty(),
+            "_meta.md manifest must not be indexed"
+        );
+
+        let ledger_hits = store
+            .reader
+            .search_pages("rawledgertoken".into(), 5)
+            .await
+            .unwrap();
+        assert!(
+            ledger_hits.is_empty(),
+            "raw ledger (no frontmatter) must not be indexed"
+        );
 
         handle.shutdown().await;
         drop(store);
@@ -751,5 +910,43 @@ mod tests {
             !names.contains(&"symlinked.md".to_string()),
             "symlink to outside file must be skipped; got: {names:?}"
         );
+    }
+
+    /// Direct notify events must use the same symlink guard as full-tree walks;
+    /// otherwise a symlinked markdown file can be opened before reconciliation
+    /// gets a chance to skip it.
+    #[cfg(any(unix, windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_file_event_skips_symlink() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        let proj_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+
+        let secret = tmp.path().join("outside-secret.md");
+        std::fs::write(&secret, "directsymlinksecret should not index\n").unwrap();
+
+        let symlink = proj_dir.join("symlinked.md");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, &symlink).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&secret, &symlink).unwrap();
+
+        let event = notify_debouncer_full::DebouncedEvent::new(
+            notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+                .add_path(symlink),
+            std::time::Instant::now(),
+        );
+        handle_event(&wiki, event).await;
+
+        let hits = store
+            .reader
+            .search_pages("directsymlinksecret".into(), 5)
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "direct symlink event must not be indexed");
     }
 }

@@ -1513,7 +1513,7 @@ async fn handle_purge_project(
         .to_string();
     let mut files_deleted: Vec<String> = Vec::new();
     let mut files_failed: Vec<String> = Vec::new();
-    match state.wiki.remove_project_dir(ws_id, proj_id) {
+    match state.wiki.remove_project_dir(ws_id, proj_id).await {
         Ok(()) => {
             files_deleted.push(proj_root_str);
         }
@@ -2393,7 +2393,7 @@ async fn copy_purge_merge(
         .to_string();
     let mut files_deleted: Vec<String> = Vec::new();
     let mut files_failed: Vec<String> = Vec::new();
-    match state.wiki.remove_project_dir(src_ws, src_proj) {
+    match state.wiki.remove_project_dir(src_ws, src_proj).await {
         Ok(()) => files_deleted.push(proj_root_str),
         Err(e) => {
             warn!(path = %proj_root_str, error = %e, "move-project: failed to remove source dir");

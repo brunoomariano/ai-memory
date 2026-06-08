@@ -14,11 +14,12 @@ on a homelab box where mistakes are harder to undo.
 | `backup --output-path` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
 | `reset --confirm` | ❌ **stop the server first** | yes, all data | no | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
+| `reindex` | ❌ **stop the server first** | no wiki wipe; requires a clean DB | only with prior DB backup | Rebuilds pages/links/FTS from `wiki/` using `_meta.md` manifests. Refuses if SQLite already has rows so stale DB-only state cannot survive silently. |
 
-All five commands route through the HTTP admin API except `reset` and
-`restore`, which are direct-disk operations that fundamentally cannot
-run while another process holds the SQLite WAL writer. See [CLAUDE.md
-§16](../CLAUDE.md) for the invariant.
+State-touching commands route through the HTTP admin API except `reset`,
+`restore`, and `reindex`, which are direct-disk lifecycle operations that
+fundamentally cannot run while another process holds the SQLite WAL writer. See
+[CLAUDE.md §16](../CLAUDE.md) for the invariant.
 
 ## What "project isolation" means here
 
@@ -28,12 +29,14 @@ Every project's data lives under an isolated, UUID-keyed root on disk:
 <wiki_root>/
 ├── .git/
 ├── <workspace_id>/
+│   ├── _meta.md                 # workspace name for rebuilds
 │   └── <project_id>/
 │       ├── concepts/
 │       ├── decisions/
 │       ├── gotchas/
 │       ├── sessions/
 │       ├── _rules/
+│       ├── _meta.md             # project name + repo_path for rebuilds
 │       ├── log-YYYY-MM.md      # rolling event log, one file per month
 │       └── bootstrap.md
 └── <other_workspace_id>/
@@ -52,6 +55,11 @@ The git history is rooted at `<wiki_root>` (one repo, all projects
 as subtrees). A `git log` from inside the wiki dir shows changes
 across every project; per-project diffs are also possible via
 `git log -- <workspace_id>/<project_id>/`.
+
+Each workspace directory also carries `<workspace_id>/_meta.md`, and each
+project directory carries `<workspace_id>/<project_id>/_meta.md`. Those small
+frontmatter-only manifests store human names (plus `repo_path` for projects),
+so a clean SQLite DB can be rebuilt from the UUID-keyed wiki tree alone.
 
 ## Command-by-command
 
@@ -324,6 +332,36 @@ you can also just `rm -rf <host-path>/*` after stopping the
 container - but `ai-memory reset` is the cross-platform path that
 works whether the data dir is local, bind-mounted, or in a named
 volume.
+
+### `reindex`
+
+```bash
+ai-memory reindex --data-dir <path>
+```
+
+Direct-disk lifecycle operation. Refuses if any sibling `ai-memory` process is
+alive, and also refuses if SQLite already contains rows. `reindex` is a
+rebuild-from-files path, not an in-place dirty-index repair.
+
+Use it when the markdown wiki is intact but you intentionally want a fresh
+SQLite migration lineage:
+
+1. Stop the server or container.
+2. Take a backup of the current data directory.
+3. Move or remove `<data-dir>/db/memory.sqlite` and its WAL/SHM siblings.
+4. Run `ai-memory reindex --data-dir <data-dir>`.
+5. Run `ai-memory embed` after restart if you need embeddings rebuilt.
+
+What is rebuilt:
+
+- Workspaces and projects from `_meta.md`, preserving the UUIDs encoded in the
+  wiki directory names.
+- Latest page rows, page links, and FTS from markdown files.
+
+What is not rebuilt:
+
+- Sessions, observations, handoffs, users/tokens, audit rows, access counters,
+  and embeddings. Those are DB-only state; keep a backup if you need them.
 
 ## Operator workflows
 
