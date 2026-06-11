@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- Release publication now limits the GitHub Release asset download step to
+  `ai-memory-*` artifacts, avoiding Docker Buildx side artifacts that can make
+  tag workflows fail after binaries and Docker images are already published.
 
 ## [0.14.0] - 2026-06-11
 ### Added
