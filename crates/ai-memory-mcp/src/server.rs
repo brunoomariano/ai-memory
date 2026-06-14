@@ -1,6 +1,6 @@
 //! [`AiMemoryServer`] — the MCP server skeleton + tool router.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use ai_memory_core::{
     SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider};
-use ai_memory_store::{DecayParams, PageHit, ReaderPool, WriterHandle};
+use ai_memory_store::{DecayParams, PageHit, ReaderPool, ScopeName, ScopeResolver, WriterHandle};
 use ai_memory_wiki::{Wiki, WikiError, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Extension;
@@ -502,6 +502,16 @@ struct WritePageArgs {
 
 #[tool_router]
 impl AiMemoryServer {
+    fn scope_resolver(&self) -> ScopeResolver<'_> {
+        ScopeResolver::new(&self.reader, self.workspace_id, self.project_id)
+            .with_writer(&self.writer)
+            .with_active_project(&self.active_project)
+    }
+
+    fn scope_error(err: ai_memory_store::ScopeResolutionError) -> McpError {
+        McpError::internal_error(err.to_string(), None)
+    }
+
     /// Construct a server backed by the given reader/writer + 3-tuple
     /// identity coordinates.
     #[must_use]
@@ -609,32 +619,17 @@ impl AiMemoryServer {
     /// `actor` is built by [`Self::actor_key_from_parts`]; pass
     /// `ActorKey::default()` when the call site has no request context.
     /// Empty actor → fall back to the single slot (legacy behaviour).
+    #[cfg(test)]
     async fn effective_ids_with_actor(
         &self,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        let active = self.active_project.get_for(actor);
-        if let Some(name) = explicit_project.map(str::trim).filter(|s| !s.is_empty()) {
-            if let Some((active_ws, _)) = active
-                && let Ok(Some(pid)) = self.reader.find_project(active_ws, name.to_string()).await
-            {
-                return Ok((active_ws, pid));
-            }
-            if active.map(|(ws, _)| ws) != Some(self.workspace_id)
-                && let Ok(Some(pid)) = self
-                    .reader
-                    .find_project(self.workspace_id, name.to_string())
-                    .await
-            {
-                return Ok((self.workspace_id, pid));
-            }
-            return Err(McpError::internal_error(
-                format!("project '{name}' not found in the active or default workspace"),
-                None,
-            ));
-        }
-        Ok(active.unwrap_or((self.workspace_id, self.project_id)))
+        self.scope_resolver()
+            .resolve_current_or_project(explicit_project, actor)
+            .await
+            .map(ai_memory_store::ResolvedScope::as_tuple)
+            .map_err(Self::scope_error)
     }
 
     async fn effective_ids_for_read_args_with_actor(
@@ -643,41 +638,11 @@ impl AiMemoryServer {
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        match (
-            trimmed_opt(explicit_workspace),
-            trimmed_opt(explicit_project),
-        ) {
-            (Some(workspace), Some(project)) => self.lookup_ids(workspace, project).await,
-            (Some(_), None) => Err(McpError::internal_error(
-                "workspace and project must be provided together",
-                None,
-            )),
-            (None, project) => self.effective_ids_with_actor(project, actor).await,
-        }
-    }
-
-    async fn lookup_ids(
-        &self,
-        workspace: &str,
-        project: &str,
-    ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        let workspace_id = self
-            .reader
-            .find_workspace(workspace.to_owned())
+        self.scope_resolver()
+            .resolve_read_args(explicit_workspace, explicit_project, actor)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            .ok_or_else(|| {
-                McpError::internal_error(format!("workspace '{workspace}' not found"), None)
-            })?;
-        let project_id = self
-            .reader
-            .find_project(workspace_id, project.to_owned())
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            .ok_or_else(|| {
-                McpError::internal_error(format!("project '{project}' not found"), None)
-            })?;
-        Ok((workspace_id, project_id))
+            .map(ai_memory_store::ResolvedScope::as_tuple)
+            .map_err(Self::scope_error)
     }
 
     /// Resolve the target for a WRITE, **creating** the workspace/project when
@@ -719,65 +684,31 @@ impl AiMemoryServer {
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        let Some(project) = trimmed_opt(explicit_project) else {
-            if trimmed_opt(explicit_workspace).is_some() {
-                return Err(McpError::internal_error(
-                    "workspace and project must be provided together",
-                    None,
-                ));
-            }
-            // No explicit project → current project (hook-published active, or
-            // the baked default).
-            return Ok(self
-                .active_project
-                .get_for(actor)
-                .unwrap_or((self.workspace_id, self.project_id)));
-        };
-        let workspace_id = match trimmed_opt(explicit_workspace) {
-            Some(name) => self
-                .writer
-                .get_or_create_workspace(name.to_string())
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
-            // No explicit workspace → the cwd's (active) workspace, not the
-            // baked global default — keeps writes consistent with reads.
-            None => self
-                .active_project
-                .get_for(actor)
-                .map(|(ws, _)| ws)
-                .unwrap_or(self.workspace_id),
-        };
-        let project_id = self
-            .writer
-            .get_or_create_project(workspace_id, project.to_string(), None)
+        self.scope_resolver()
+            .resolve_write_args(explicit_workspace, explicit_project, actor)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok((workspace_id, project_id))
+            .map(ai_memory_store::ResolvedScope::as_tuple)
+            .map_err(Self::scope_error)
     }
 
     async fn resolve_query_scopes(
         &self,
         scopes: &[MemoryScopeArg],
     ) -> Result<Vec<(WorkspaceId, ProjectId)>, McpError> {
-        if scopes.len() > MAX_QUERY_SCOPES {
-            return Err(McpError::internal_error(
-                format!("at most {MAX_QUERY_SCOPES} scopes are allowed"),
-                None,
-            ));
-        }
-        let mut seen = HashSet::new();
-        let mut resolved = Vec::new();
-        for scope in scopes {
-            let workspace = trimmed_opt(Some(&scope.workspace))
-                .ok_or_else(|| McpError::internal_error("scope workspace cannot be empty", None))?;
-            let project = trimmed_opt(Some(&scope.project))
-                .ok_or_else(|| McpError::internal_error("scope project cannot be empty", None))?;
-            let ids = self.lookup_ids(workspace, project).await?;
-            if seen.insert(ids) {
-                resolved.push(ids);
-            }
-        }
-        Ok(resolved)
+        let names: Vec<_> = scopes
+            .iter()
+            .map(|scope| ScopeName::new(&scope.workspace, &scope.project))
+            .collect();
+        self.scope_resolver()
+            .resolve_many_existing(&names, MAX_QUERY_SCOPES)
+            .await
+            .map(|scopes| {
+                scopes
+                    .into_iter()
+                    .map(ai_memory_store::ResolvedScope::as_tuple)
+                    .collect()
+            })
+            .map_err(Self::scope_error)
     }
 
     async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
@@ -1827,10 +1758,6 @@ fn checkpoint_or_warn(wiki: &Wiki, message: impl AsRef<str>) -> Option<String> {
 
 fn is_missing_wiki_file(err: &WikiError) -> bool {
     matches!(err, WikiError::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
-}
-
-fn trimmed_opt(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// Description of how long it's been since the last observation.

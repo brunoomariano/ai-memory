@@ -18,6 +18,7 @@ mod fts_query;
 mod migrations;
 mod ops;
 mod reader;
+mod scope;
 pub mod users;
 mod writer;
 
@@ -32,6 +33,10 @@ pub use reader::{
     PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool,
     ReindexTargetStatus, RelatedPage, ScopeRow, StatusCounts, StoredEmbedding, StoredPageBody,
     WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+};
+pub use scope::{
+    ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
+    create_explicit_scope, lookup_existing_scope, resolve_many_existing_scopes,
 };
 pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use writer::WriterHandle;

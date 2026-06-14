@@ -25,7 +25,7 @@ pub const DEFAULT_PROJECT_NAME: &str = "scratch";
 pub use active_project::{
     ActiveProject, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES, DEFAULT_PER_KEY_TTL,
 };
-pub use actor::{ActorContext, AuthLevel};
+pub use actor::{ActorContext, AuthLevel, AuthzError, Capability};
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{Handoff, HandoffState, NewHandoff};
 pub use ids::{

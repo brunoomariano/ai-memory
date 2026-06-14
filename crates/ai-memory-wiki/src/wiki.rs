@@ -776,8 +776,10 @@ impl Wiki {
     }
 
     /// Atomically apply a batch of page writes. Either all pages land
-    /// (one SQL transaction) and their files are renamed into place,
-    /// or no DB row changes and tempfiles are dropped.
+    /// (one SQL transaction) and their files are renamed into place.
+    /// Files are installed before the SQL batch so markdown remains the source
+    /// of truth; if the SQL batch fails at runtime, installed files are rolled
+    /// back best-effort to their prior contents.
     ///
     /// # Errors
     /// Returns [`WikiError`] for any filesystem, parsing, or store
@@ -877,15 +879,32 @@ impl Wiki {
                 })
                 .collect();
 
-            let ids = self.writer.upsert_pages_batch(pages).await?;
-
-            // SQL succeeded; rename tempfiles into place.
+            // Install files first so the DB is never ahead of markdown. If the
+            // SQL batch fails below, rollback restores the prior disk state;
+            // if the process crashes in this window, startup/reindex repairs
+            // the derived DB from the markdown source of truth.
+            let mut installed = Vec::with_capacity(staged_files.len());
             let mut dispatches = Vec::with_capacity(staged_files.len());
             for (req, tmp, abs, ctx) in staged_files {
-                let persisted = tmp.persist(&abs)?;
-                persisted.sync_data()?;
+                let install = match persist_tmp_with_rollback_snapshot(tmp, &abs) {
+                    Ok(install) => install,
+                    Err(e) => {
+                        rollback_or_inconsistent(&installed, &e)?;
+                        return Err(e);
+                    }
+                };
+                installed.push(install);
                 dispatches.push((req.path, req.frontmatter, req.body, ctx));
             }
+
+            let ids = match self.writer.upsert_pages_batch(pages).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    rollback_or_inconsistent(&installed, &e)?;
+                    return Err(e.into());
+                }
+            };
+
             (ids, dispatches)
         };
 
@@ -993,9 +1012,10 @@ impl Wiki {
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            atomic::write_atomic(&abs, emitted.as_bytes())?;
+            let installed = replace_file_with_rollback_snapshot(&abs, emitted.as_bytes())?;
 
-            self.writer
+            match self
+                .writer
                 .upsert_page(NewPage {
                     workspace_id,
                     project_id,
@@ -1008,7 +1028,14 @@ impl Wiki {
                     links,
                     author_id,
                 })
-                .await?
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    rollback_or_inconsistent(std::slice::from_ref(&installed), &e)?;
+                    return Err(e.into());
+                }
+            }
         };
         // Embed if configured. We do this on the caller's task so the
         // tool reply still happens "indexes commit in the same
@@ -1101,6 +1128,79 @@ pub struct WritePageRequest {
 
 fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
     crate::WikiError::Io(std::io::Error::other(msg.to_string()))
+}
+
+#[derive(Debug)]
+struct InstalledFile {
+    path: PathBuf,
+    previous: Option<Vec<u8>>,
+}
+
+fn snapshot_existing_file(path: &Path) -> WikiResult<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(WikiError::Io(e)),
+    }
+}
+
+fn sync_parent_best_effort(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
+fn persist_tmp_with_rollback_snapshot(
+    tmp: tempfile::NamedTempFile,
+    path: &Path,
+) -> WikiResult<InstalledFile> {
+    let previous = snapshot_existing_file(path)?;
+    let persisted = tmp.persist(path)?;
+    persisted.sync_data()?;
+    sync_parent_best_effort(path);
+    Ok(InstalledFile {
+        path: path.to_path_buf(),
+        previous,
+    })
+}
+
+fn replace_file_with_rollback_snapshot(path: &Path, bytes: &[u8]) -> WikiResult<InstalledFile> {
+    let previous = snapshot_existing_file(path)?;
+    atomic::write_atomic(path, bytes)?;
+    Ok(InstalledFile {
+        path: path.to_path_buf(),
+        previous,
+    })
+}
+
+fn rollback_installed_files(installed: &[InstalledFile]) -> WikiResult<()> {
+    for file in installed.iter().rev() {
+        match &file.previous {
+            Some(bytes) => {
+                atomic::write_atomic(&file.path, bytes)?;
+            }
+            None => match std::fs::remove_file(&file.path) {
+                Ok(()) => sync_parent_best_effort(&file.path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(WikiError::Io(e)),
+            },
+        }
+    }
+    Ok(())
+}
+
+fn rollback_or_inconsistent<E: std::fmt::Display>(
+    installed: &[InstalledFile],
+    cause: &E,
+) -> WikiResult<()> {
+    if let Err(rollback_err) = rollback_installed_files(installed) {
+        return Err(WikiError::Io(std::io::Error::other(format!(
+            "INCONSISTENT STATE: wiki files changed but store write failed ({cause}) and rollback failed ({rollback_err})"
+        ))));
+    }
+    Ok(())
 }
 
 fn quarantine_file(path: &Path) -> std::io::Result<Option<PathBuf>> {
@@ -1329,6 +1429,61 @@ mod tests {
         assert!(hits[0].snippet.contains("compile"));
     }
 
+    #[tokio::test]
+    async fn write_page_rolls_back_file_when_store_upsert_fails() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let path = PagePath::new("notes/rollback.md").unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            path.as_str(),
+            "old body",
+            serde_json::json!({ "title": "Old" }),
+        ))
+        .await
+        .unwrap();
+
+        let mut bad = req(
+            ws,
+            proj,
+            path.as_str(),
+            "new body should not remain",
+            serde_json::json!({ "title": "New" }),
+        );
+        bad.author_id = Some(ai_memory_core::UserId::new());
+        let err = wiki.write_page(bad).await.unwrap_err();
+        assert!(
+            err.to_string().contains("FOREIGN KEY") || err.to_string().contains("constraint"),
+            "expected FK failure, got {err}"
+        );
+
+        let on_disk = std::fs::read_to_string(wiki.abs_path(ws, proj, &path)).unwrap();
+        assert!(on_disk.contains("old body"));
+        assert!(!on_disk.contains("new body should not remain"));
+
+        let stored = store
+            .reader
+            .page_body_by_ids(ws, proj, path.as_str())
+            .await
+            .unwrap()
+            .expect("old row should remain latest");
+        assert_eq!(stored.body, "old body");
+        assert_eq!(stored.title, "Old");
+    }
+
     /// Defence-in-depth: anything that reaches `write_page` gets
     /// scrubbed at the wiki boundary, even if upstream callers (LLM
     /// consolidation output, manual `write-page` CLI input, MCP tool
@@ -1472,6 +1627,84 @@ mod tests {
         assert_eq!(counts.pages_latest, 5);
         let hits = store.reader.search_pages("batch".into(), 10).await.unwrap();
         assert_eq!(hits.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_rolls_back_files_when_sql_batch_fails() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let existing = PagePath::new("batch/existing.md").unwrap();
+        let created = PagePath::new("batch/new.md").unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            existing.as_str(),
+            "old batch body",
+            serde_json::json!({ "title": "Old Batch" }),
+        ))
+        .await
+        .unwrap();
+
+        let mut replace_existing = req(
+            ws,
+            proj,
+            existing.as_str(),
+            "new batch body should roll back",
+            serde_json::json!({ "title": "New Batch" }),
+        );
+        replace_existing.author_id = Some(ai_memory_core::UserId::new());
+        let mut create_new = req(
+            ws,
+            proj,
+            created.as_str(),
+            "new file should be removed",
+            serde_json::json!({ "title": "Created" }),
+        );
+        create_new.author_id = Some(ai_memory_core::UserId::new());
+
+        let err = wiki
+            .apply_batch(vec![replace_existing, create_new])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("FOREIGN KEY") || err.to_string().contains("constraint"),
+            "expected FK failure, got {err}"
+        );
+
+        let existing_body = std::fs::read_to_string(wiki.abs_path(ws, proj, &existing)).unwrap();
+        assert!(existing_body.contains("old batch body"));
+        assert!(!existing_body.contains("new batch body should roll back"));
+        assert!(!wiki.abs_path(ws, proj, &created).exists());
+
+        let counts = store.reader.status_counts().await.unwrap();
+        assert_eq!(counts.pages_latest, 1);
+        let stored = store
+            .reader
+            .page_body_by_ids(ws, proj, existing.as_str())
+            .await
+            .unwrap()
+            .expect("old row should remain latest");
+        assert_eq!(stored.body, "old batch body");
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, created.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

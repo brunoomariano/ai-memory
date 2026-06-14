@@ -1,10 +1,13 @@
 //! JSON routes for third-party read-only frontends.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ai_memory_core::{PageId, PagePath, ProjectId, WorkspaceId};
-use ai_memory_store::{BriefingSnapshot, HealthPage, PageHit, RelatedPage};
+use ai_memory_store::{
+    BriefingSnapshot, HealthPage, PageHit, RelatedPage, ScopeName, ScopeResolutionError,
+    lookup_existing_scope, resolve_many_existing_scopes,
+};
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -335,23 +338,22 @@ async fn resolve_scopes(
     state: &WebState,
     scopes: &[ApiSearchScope],
 ) -> Result<Vec<ResolvedSearchScope>, Response> {
-    let mut seen = HashSet::new();
-    let mut resolved = Vec::new();
-    for scope in scopes {
-        let workspace = trimmed_opt(Some(&scope.workspace)).ok_or_else(|| {
-            json_error(StatusCode::BAD_REQUEST, "scope workspace cannot be empty")
-        })?;
-        let project = trimmed_opt(Some(&scope.project))
-            .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "scope project cannot be empty"))?;
-        let (workspace_id, project_id) = lookup_project(state, workspace, project).await?;
-        if seen.insert((workspace_id, project_id)) {
-            resolved.push(ResolvedSearchScope {
-                project_id,
-                workspace_id,
-            });
-        }
-    }
-    Ok(resolved)
+    let names: Vec<_> = scopes
+        .iter()
+        .map(|scope| ScopeName::new(&scope.workspace, &scope.project))
+        .collect();
+    resolve_many_existing_scopes(&state.reader, &names, MAX_SEARCH_SCOPES)
+        .await
+        .map(|scopes| {
+            scopes
+                .into_iter()
+                .map(|scope| ResolvedSearchScope {
+                    workspace_id: scope.workspace_id,
+                    project_id: scope.project_id,
+                })
+                .collect()
+        })
+        .map_err(scope_error_response)
 }
 
 async fn search_scopes(
@@ -560,19 +562,15 @@ async fn lookup_project(
     workspace: &str,
     project: &str,
 ) -> Result<(WorkspaceId, ProjectId), Response> {
-    let workspace_id = state
-        .reader
-        .find_workspace(workspace.to_owned())
+    lookup_existing_scope(&state.reader, workspace, project)
         .await
-        .map_err(internal_error)?
-        .ok_or_else(|| not_found(format!("workspace '{workspace}' not found")))?;
-    let project_id = state
-        .reader
-        .find_project(workspace_id, project.to_owned())
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| not_found(format!("project '{project}' not found")))?;
-    Ok((workspace_id, project_id))
+        .map(ai_memory_store::ResolvedScope::as_tuple)
+        .map_err(|err| match err {
+            ScopeResolutionError::ProjectNotFoundInWorkspace { project, .. } => {
+                not_found(format!("project '{project}' not found"))
+            }
+            other => scope_error_response(other),
+        })
 }
 
 async fn enrich_hits(state: &WebState, hits: Vec<PageHit>) -> Result<Vec<ApiSearchHit>, Response> {
@@ -604,6 +602,16 @@ fn internal_error(e: impl std::fmt::Display) -> Response {
 
 fn not_found(message: impl Into<String>) -> Response {
     json_error(StatusCode::NOT_FOUND, message)
+}
+
+fn scope_error_response(err: ScopeResolutionError) -> Response {
+    if err.is_bad_request() {
+        json_error(StatusCode::BAD_REQUEST, err.to_string())
+    } else if err.is_not_found() {
+        json_error(StatusCode::NOT_FOUND, err.to_string())
+    } else {
+        internal_error(err)
+    }
 }
 
 fn json_error(status: StatusCode, message: impl Into<String>) -> Response {

@@ -96,16 +96,28 @@ without disturbing the rest of the file.
   library functions, render output. Provider-specific behavior belongs in the
   provider module, not in command handlers.
 - Treat typed boundaries as load-bearing: IDs, `PagePath`, `AgentKind`,
-  sanitization, workspace/project resolution, and provider dialects should be
-  parsed or normalized once and reused.
-- Preserve workspace/project isolation at shared helper boundaries. Read,
-  search, embed, retention, and destructive paths must use no-create lookups
-  and fail closed on partial or missing scope; only explicit write/create
-  paths may create workspaces or projects.
-- Preserve auth boundaries at shared router/helper boundaries. In multi-user
-  mode, every `/admin/*` route is root-only; DB-user tokens are for normal
-  MCP/API read/write attribution and must not bypass admin gates or admission
-  webhooks.
+  sanitization, workspace/project resolution, auth capability, and provider
+  dialects should be parsed or normalized once and reused.
+- Preserve workspace/project isolation through the shared scope framework.
+  New MCP/admin/web routes must use `ai_memory_store::ScopeResolver` or its
+  explicit helpers (`lookup_existing_scope`, `create_explicit_scope`,
+  `resolve_many_existing_scopes`) instead of hand-rolled workspace/project
+  lookup chains. Read, search, embed, retention, and destructive paths must use
+  no-create lookups and fail closed on partial or missing scope; only explicit
+  write/create paths may create workspaces or projects. PRs touching scope
+  resolution need table-driven tests for partial scope, missing explicit scope,
+  active-project precedence, and cross-workspace isolation.
+- Preserve auth boundaries through `AuthLevel::authorize(Capability::...)`.
+  Do not open-code username comparisons or ad hoc root checks in handlers. In
+  multi-user mode, every `/admin/*` route is root-only; DB-user tokens are for
+  normal MCP/API read/write attribution and must not bypass admin gates or
+  admission webhooks. PRs touching permissions need tests for root, DB-user,
+  and anonymous behavior.
+- Treat markdown as the source of truth and SQLite as the derived index. Wiki
+  mutations must go through `Wiki::write_page`, `Wiki::apply_batch`, or the
+  existing destructive helpers so sanitization, admission, attribution,
+  rollback, and index updates stay together. Do not write wiki files directly
+  from handlers; add recovery/rollback tests for any new disk+SQL mutation.
 - Prefer explicit fallbacks over `unwrap`, `expect`, or `unreachable!` in
   runtime paths. Panics are acceptable in tests only.
 - Do not use `unsafe` for performance work in this project unless profiling

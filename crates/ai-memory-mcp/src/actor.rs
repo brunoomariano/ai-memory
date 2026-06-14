@@ -24,7 +24,7 @@
 //! bypass a reject-policy admission webhook by setting a client-controlled
 //! header.
 
-use ai_memory_core::{ActorContext, AuthLevel, UserId};
+use ai_memory_core::{ActorContext, AuthLevel, Capability, UserId};
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
 
@@ -98,11 +98,18 @@ pub fn skip_webhooks_from_headers(headers: &HeaderMap) -> Vec<String> {
 /// Parse the skip-list header only for trusted re-entry contexts.
 #[must_use]
 pub fn skip_webhooks_from_parts(parts: &Parts) -> Vec<String> {
-    match parts.extensions.get::<AuthLevel>().copied() {
-        Some(AuthLevel::User) => Vec::new(),
-        Some(AuthLevel::Root | AuthLevel::Anonymous) | None => {
-            skip_webhooks_from_headers(&parts.headers)
-        }
+    let level = parts
+        .extensions
+        .get::<AuthLevel>()
+        .copied()
+        .unwrap_or(AuthLevel::Anonymous);
+    if level
+        .authorize(Capability::SkipAdmissionChain, true)
+        .is_ok()
+    {
+        skip_webhooks_from_headers(&parts.headers)
+    } else {
+        Vec::new()
     }
 }
 

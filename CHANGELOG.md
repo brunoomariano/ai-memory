@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Centralized workspace/project scope resolution in `ai_memory_store::ScopeResolver`
+  and shared explicit helpers, then migrated MCP, admin, and web API routes onto
+  the common no-create/create-on-write policies.
+- Centralized auth checks behind `AuthLevel::authorize(Capability::...)` so admin,
+  user-management, and admission-skip behavior share one permission framework.
+- Tightened wiki/SQLite consistency semantics: markdown remains the source of
+  truth, batch writes install files before committing the derived SQL index, and
+  runtime SQL failures roll installed files back best-effort.
+
+### Added
+- Regression tests for shared scope policies, capability authorization, and
+  wiki-file rollback when `write_page` / `apply_batch` store upserts fail.
+
 ## [1.0.5] - 2026-06-14
 
 ### Fixed

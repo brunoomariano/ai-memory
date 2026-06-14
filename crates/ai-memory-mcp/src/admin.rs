@@ -35,12 +35,13 @@ use ai_memory_consolidate::{
     prune_sources_to_budget, run_lint, run_sweep,
 };
 use ai_memory_core::{
-    ActiveProject, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId,
-    Tier, WorkspaceId,
+    ActiveProject, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME, PagePath, ProjectId,
+    SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use ai_memory_store::{
-    DecayParams, EmbeddingWrite, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes,
+    DecayParams, EmbeddingWrite, ReaderPool, ScopeResolutionError, StoreError, WriterHandle,
+    create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope,
 };
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
 use axum::Json;
@@ -212,29 +213,27 @@ async fn require_root_for_multiuser_admin(
     req: axum::http::Request<Body>,
     next: Next,
 ) -> Response {
-    if state.token_pepper.is_none() {
-        return next.run(req).await;
-    }
     let level = req
         .extensions()
         .get::<ai_memory_core::AuthLevel>()
         .copied()
         .unwrap_or(ai_memory_core::AuthLevel::Anonymous);
-    if level.is_root() {
-        return next.run(req).await;
+    match level.authorize(Capability::Admin, state.token_pepper.is_some()) {
+        Ok(()) => next.run(req).await,
+        Err(e) => (
+            authz_status(e),
+            Json(serde_json::json!({ "error": e.message() })),
+        )
+            .into_response(),
     }
-    let (code, msg) = match level {
-        ai_memory_core::AuthLevel::Anonymous => (
-            StatusCode::UNAUTHORIZED,
-            "admin operation requires authentication in multi-user mode",
-        ),
-        ai_memory_core::AuthLevel::User => (
-            StatusCode::FORBIDDEN,
-            "admin operation is root-only in multi-user mode",
-        ),
-        ai_memory_core::AuthLevel::Root => return next.run(req).await,
-    };
-    (code, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+fn authz_status(err: ai_memory_core::AuthzError) -> StatusCode {
+    if err.is_authentication_required() {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::FORBIDDEN
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -624,17 +623,10 @@ async fn create_ws_proj(
     workspace: &str,
     project: &str,
 ) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
-    let ws = state
-        .writer
-        .get_or_create_workspace(workspace.to_string())
+    create_explicit_scope(&state.writer, workspace, project)
         .await
-        .map_err(|e| internal_err(format!("workspace: {e}")))?;
-    let proj = state
-        .writer
-        .get_or_create_project(ws, project.to_string(), None)
-        .await
-        .map_err(|e| internal_err(format!("project: {e}")))?;
-    Ok((ws, proj))
+        .map(ai_memory_store::ResolvedScope::as_tuple)
+        .map_err(scope_err)
 }
 
 /// Look up workspace + project by name **without** auto-creating them.
@@ -646,31 +638,41 @@ async fn lookup_ws_proj_no_create(
     workspace: &str,
     project: &str,
 ) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
-    let ws_id = match state.reader.find_workspace(workspace.to_string()).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("workspace '{workspace}' not found")
-                })),
-            ));
-        }
-        Err(e) => return Err(internal_err(e.to_string())),
+    lookup_existing_scope(&state.reader, workspace, project)
+        .await
+        .map(ai_memory_store::ResolvedScope::as_tuple)
+        .map_err(scope_err)
+}
+
+fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>) {
+    let status = if err.is_bad_request() {
+        StatusCode::BAD_REQUEST
+    } else if err.is_not_found() {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
     };
-    let proj_id = match state.reader.find_project(ws_id, project.to_string()).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("project '{project}' not found in workspace '{workspace}'")
-                })),
-            ));
-        }
-        Err(e) => return Err(internal_err(e.to_string())),
-    };
-    Ok((ws_id, proj_id))
+    (
+        status,
+        Json(serde_json::json!({ "error": err.to_string() })),
+    )
+}
+
+fn skip_webhooks_for_admin_request(
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: &HeaderMap,
+) -> Vec<String> {
+    let level = level_ext
+        .map(|axum::Extension(level)| level)
+        .unwrap_or(ai_memory_core::AuthLevel::Anonymous);
+    if level
+        .authorize(Capability::SkipAdmissionChain, true)
+        .is_ok()
+    {
+        crate::actor::skip_webhooks_from_headers(headers)
+    } else {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -2847,12 +2849,7 @@ async fn handle_write_page(
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
     let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
-    let skip_webhooks = match level_ext.map(|axum::Extension(level)| level) {
-        Some(ai_memory_core::AuthLevel::User) => Vec::new(),
-        Some(ai_memory_core::AuthLevel::Root | ai_memory_core::AuthLevel::Anonymous) | None => {
-            crate::actor::skip_webhooks_from_headers(&headers)
-        }
-    };
+    let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
     let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
         Some(AdmissionContext {
             op: AdmissionOp::WritePage,
@@ -2974,12 +2971,7 @@ async fn handle_delete_page(
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
-    let skip_webhooks = match level_ext.map(|axum::Extension(level)| level) {
-        Some(ai_memory_core::AuthLevel::User) => Vec::new(),
-        Some(ai_memory_core::AuthLevel::Root | ai_memory_core::AuthLevel::Anonymous) | None => {
-            crate::actor::skip_webhooks_from_headers(&headers)
-        }
-    };
+    let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
     let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
         Some(AdmissionContext {
             actor,
@@ -3064,18 +3056,14 @@ struct UserListResponse {
 fn require_root(
     level: ai_memory_core::AuthLevel,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if level.is_root() {
-        return Ok(());
-    }
-    let (code, msg) = match level {
-        ai_memory_core::AuthLevel::Anonymous => (
-            StatusCode::UNAUTHORIZED,
-            "user management requires authentication",
-        ),
-        ai_memory_core::AuthLevel::User => (StatusCode::FORBIDDEN, "user management is root-only"),
-        ai_memory_core::AuthLevel::Root => return Ok(()),
-    };
-    Err((code, Json(serde_json::json!({ "error": msg }))))
+    level
+        .authorize(Capability::UserManagement, true)
+        .map_err(|e| {
+            (
+                authz_status(e),
+                Json(serde_json::json!({ "error": e.message() })),
+            )
+        })
 }
 
 /// Get the active token-pepper. Returns 503 when multi-user wasn't

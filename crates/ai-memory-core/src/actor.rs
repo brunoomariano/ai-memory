@@ -111,6 +111,53 @@ pub enum AuthLevel {
     User,
 }
 
+/// Coarse-grained capabilities guarded by the auth layer.
+///
+/// This is intentionally smaller than a role/RBAC system: ai-memory v1 is
+/// single-tenant, so the policy surface is "normal read/write is allowed"
+/// versus "this operational action needs root". Keeping that decision in one
+/// enum prevents future handlers from open-coding subtly different checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// Operational `/admin/*` routes. In multi-user mode these are root-only;
+    /// in single-user/no-auth mode historical behavior is preserved.
+    Admin,
+    /// User lifecycle routes (`/admin/users*`). These are root-only even when
+    /// multi-user mode is not fully configured.
+    UserManagement,
+    /// Regular read surfaces (MCP/query/API/wiki reads).
+    NormalRead,
+    /// Regular write surfaces that attribute to the resolved actor.
+    NormalWrite,
+    /// Loop-prevention admission-chain skip header.
+    SkipAdmissionChain,
+}
+
+/// Authorization failure independent of any HTTP framework.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthzError {
+    /// The caller must authenticate before the capability can be used.
+    AuthenticationRequired(&'static str),
+    /// The caller authenticated, but the capability is root-only.
+    Forbidden(&'static str),
+}
+
+impl AuthzError {
+    /// Human-readable policy message for HTTP/MCP responses.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            AuthzError::AuthenticationRequired(msg) | AuthzError::Forbidden(msg) => msg,
+        }
+    }
+
+    /// True when the response should be an authentication challenge (HTTP 401).
+    #[must_use]
+    pub fn is_authentication_required(self) -> bool {
+        matches!(self, AuthzError::AuthenticationRequired(_))
+    }
+}
+
 impl AuthLevel {
     /// `true` if this tier is allowed to perform root-only admin
     /// operations (currently just `Root`). Centralises the
@@ -119,6 +166,49 @@ impl AuthLevel {
     #[must_use]
     pub fn is_root(self) -> bool {
         matches!(self, AuthLevel::Root)
+    }
+
+    /// Check whether this auth tier can use `capability`.
+    ///
+    /// `multi_user_enabled` mirrors the configured `[auth].token_pepper` gate:
+    /// operational admin routes keep their historical single-user behavior
+    /// until multi-user mode is enabled, while user-management is always
+    /// root-only.
+    pub fn authorize(
+        self,
+        capability: Capability,
+        multi_user_enabled: bool,
+    ) -> Result<(), AuthzError> {
+        match capability {
+            Capability::NormalRead | Capability::NormalWrite => Ok(()),
+            Capability::SkipAdmissionChain => match self {
+                AuthLevel::User => {
+                    Err(AuthzError::Forbidden("admission webhook skip is root-only"))
+                }
+                AuthLevel::Anonymous | AuthLevel::Root => Ok(()),
+            },
+            Capability::Admin if !multi_user_enabled => Ok(()),
+            Capability::Admin => self.require_root(
+                "admin operation requires authentication in multi-user mode",
+                "admin operation is root-only in multi-user mode",
+            ),
+            Capability::UserManagement => self.require_root(
+                "user management requires authentication",
+                "user management is root-only",
+            ),
+        }
+    }
+
+    fn require_root(
+        self,
+        anonymous_message: &'static str,
+        user_message: &'static str,
+    ) -> Result<(), AuthzError> {
+        match self {
+            AuthLevel::Root => Ok(()),
+            AuthLevel::Anonymous => Err(AuthzError::AuthenticationRequired(anonymous_message)),
+            AuthLevel::User => Err(AuthzError::Forbidden(user_message)),
+        }
     }
 }
 
@@ -158,6 +248,68 @@ mod tests {
         let a = ActorContext::default();
         assert!(!a.has_any(), "default actor must be fully anonymous");
         assert_eq!(a, ActorContext::anonymous());
+    }
+
+    #[test]
+    fn admin_capability_preserves_single_user_mode() {
+        for level in [AuthLevel::Anonymous, AuthLevel::Root, AuthLevel::User] {
+            assert_eq!(level.authorize(Capability::Admin, false), Ok(()));
+        }
+    }
+
+    #[test]
+    fn admin_capability_is_root_only_in_multi_user_mode() {
+        assert_eq!(AuthLevel::Root.authorize(Capability::Admin, true), Ok(()));
+        assert!(matches!(
+            AuthLevel::Anonymous.authorize(Capability::Admin, true),
+            Err(AuthzError::AuthenticationRequired(
+                "admin operation requires authentication in multi-user mode"
+            ))
+        ));
+        assert!(matches!(
+            AuthLevel::User.authorize(Capability::Admin, true),
+            Err(AuthzError::Forbidden(
+                "admin operation is root-only in multi-user mode"
+            ))
+        ));
+    }
+
+    #[test]
+    fn user_management_is_always_root_only() {
+        assert_eq!(
+            AuthLevel::Root.authorize(Capability::UserManagement, false),
+            Ok(())
+        );
+        assert_eq!(
+            AuthLevel::Root.authorize(Capability::UserManagement, true),
+            Ok(())
+        );
+        assert!(matches!(
+            AuthLevel::Anonymous.authorize(Capability::UserManagement, false),
+            Err(AuthzError::AuthenticationRequired(
+                "user management requires authentication"
+            ))
+        ));
+        assert!(matches!(
+            AuthLevel::User.authorize(Capability::UserManagement, true),
+            Err(AuthzError::Forbidden("user management is root-only"))
+        ));
+    }
+
+    #[test]
+    fn skip_admission_chain_rejects_db_users() {
+        assert_eq!(
+            AuthLevel::Root.authorize(Capability::SkipAdmissionChain, true),
+            Ok(())
+        );
+        assert_eq!(
+            AuthLevel::Anonymous.authorize(Capability::SkipAdmissionChain, true),
+            Ok(())
+        );
+        assert!(matches!(
+            AuthLevel::User.authorize(Capability::SkipAdmissionChain, true),
+            Err(AuthzError::Forbidden("admission webhook skip is root-only"))
+        ));
     }
 
     #[test]

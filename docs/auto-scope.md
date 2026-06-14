@@ -39,6 +39,25 @@ instead of falling back to the active/default project. A `workspace`
 argument must be paired with `project`, and read/admin maintenance
 paths use find-only lookups so typos do not create empty scopes.
 
+## Implementation contract
+
+Scope resolution is centralized in `ai_memory_store::ScopeResolver` and its
+explicit helpers:
+
+- `lookup_existing_scope` for read, search, maintenance, retention, embed, and
+  destructive paths. It never creates workspaces or projects.
+- `create_explicit_scope` for explicit write/create paths only.
+- `resolve_many_existing_scopes` for multi-project search scopes, with
+  deduplication and max-scope validation.
+- `ScopeResolver::resolve_read_args` and `resolve_write_args` for MCP tools
+  that also need actor-scoped active-project fallback.
+
+New MCP, admin, or web API routes should use those helpers instead of
+hand-rolling `find_workspace` / `find_project` chains. PRs that touch scope
+resolution should include table-driven tests for partial scope rejection,
+missing explicit scope, active-project precedence, and cross-workspace
+isolation.
+
 ## Configuration
 
 ```toml

@@ -55,6 +55,14 @@ Three options surveyed:
 - DB stores `(path, mtime, size, sha256, indexed_at, provider, model, dim)` per page. On startup, fast scan vs. cached SHAs; only changed files re-parsed.
 - Embeddings keyed by `sha256(content) + provider + model + dim`. Re-embed only when content changes.
 
+**Consistency contract:** markdown is primary and SQLite is derived. There is no
+real cross-resource transaction between the filesystem and SQLite. Wiki writes
+must go through `Wiki::write_page`, `Wiki::apply_batch`, or the existing
+destructive helpers so sanitization, admission, attribution, rollback, and
+store updates stay together. Runtime store failures roll installed files back
+best-effort; crash windows are resolved by the existing markdown reindex path.
+Handlers must not write wiki files directly.
+
 ## 4. Database choice - single SQLite file
 
 **Decision: one SQLite file with FTS5, packed-vector embeddings, and SQL tables for graph edges.**

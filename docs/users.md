@@ -56,6 +56,22 @@ The rungs are sticky: a request is matched at the lowest tier that
 applies, never escalates. Root token always wins over any users-row
 collision; the two namespaces are intentionally distinct.
 
+## Implementation contract
+
+Request identity and authorization are separate:
+
+- `ActorContext` carries who made the request and is used for attribution,
+  frontmatter, audit payloads, and active-project keys.
+- `AuthLevel` carries what auth tier the middleware resolved.
+- `AuthLevel::authorize(Capability::...)` is the shared permission check for
+  admin routes, user-management routes, normal read/write surfaces, and the
+  admission-chain skip header.
+
+Handlers should not compare usernames, infer root from `ActorContext`, or add
+ad hoc root-only branches. PRs that touch auth behavior should cover root,
+DB-user, and anonymous callers, including the single-user compatibility mode
+where `[auth].token_pepper` is absent.
+
 ## Quick start
 
 > Prerequisite: a fresh `ai-memory init`. Pre-v0.8 installs need
