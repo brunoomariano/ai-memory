@@ -235,19 +235,19 @@ Any implementation should preserve these invariants:
 Default-available auto-improvement must not surprise existing installs:
 
 1. Dry-run review may be exposed by default, but it must not write wiki files,
-   pending proposal pages, handoffs, or audit rows.
+   pending proposals, handoffs, or audit rows. Staging must remain an explicit
+   operator action.
 2. Session-end triggering stays off until a bounded background scheduler and
    proposal storage exist; hooks must not gain LLM latency as a side effect of
    upgrade.
-3. No database migration is required for the dry-run-only phase. Future pending
-   proposal storage must use additive, idempotent migrations that preserve all
-   existing wiki files and session/observation rows.
+3. Pending proposal storage must use additive, idempotent migrations that
+   preserve all existing wiki files and session/observation rows.
 4. Existing installed `CLAUDE.md`/`AGENTS.md` blocks remain valid. Operators pick
    up newer proactive retrieval guidance by running `ai-memory install-instructions`
    or asking an agent to refresh the ai-memory routing block. The marker-based
    replacement must remain idempotent.
-5. Future staged/apply modes must default to reviewable staging before any
-   mutation and must keep approval attribution separate from the autonomous
+5. Staged/apply modes must default to reviewable staging before any mutation
+   and must keep approval attribution separate from the autonomous
    `auto_improve` proposal actor.
 
 ## Configuration Sketch
@@ -370,12 +370,13 @@ pages.
 
 ### Phase 1: Dry-Run Reviewer
 
-Status: implemented for explicit CLI/admin/MCP dry-runs.
+Status: implemented for explicit CLI/admin/MCP dry-runs; CLI/admin can also
+stage validated proposals for pending-writes review.
 
 Add a library-level reviewer that consumes one completed session plus existing
-wiki context and returns validated proposals. No writes except an optional run
-report. The initial shipped surface requires `--dry-run` and an explicit
-`--session-id`; it refuses staging/apply until pending proposal storage exists.
+wiki context and returns validated proposals. Dry-run writes nothing. Stage mode
+requires an explicit `--session-id`, stores pending proposal rows plus sidecars,
+and still does not write durable wiki target pages until pending-writes approval.
 
 The implemented reviewer is designed for existing projects with large histories:
 it treats the consolidated `sessions/<id>.md` page as the primary source when it

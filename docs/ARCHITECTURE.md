@@ -29,8 +29,9 @@ background reconciliation or provider-backed maintenance. The core invariant is
 unchanged: the markdown wiki is the source of truth, and SQLite is the derived
 index for search, sessions, observations, handoffs, audit, and embeddings.
 Auto-improvement sits on the provider-backed maintenance side: it reviews a
-completed session and returns validated proposals, but the shipped mode is
-dry-run-only and writes no wiki files or pending proposal pages.
+completed session and returns validated proposals. CLI/admin dry-run writes
+nothing; CLI/admin stage mode stores pending proposal rows plus non-indexed
+sidecars for later approval. MCP remains dry-run-only.
 
 **Steady-state loop:**
 
@@ -54,12 +55,13 @@ dry-run-only and writes no wiki files or pending proposal pages.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`.
-5. On explicit CLI/admin/MCP request, `auto-improve --dry-run` /
-   `memory_auto_improve` reviews one completed session with the configured LLM,
-   validates proposed `concepts/`, `decisions/`, `gotchas/`, `procedures/`, and
-   `_rules/` edits, and returns a report. It does not run on SessionEnd by
-   default and does not write durable pages, pending proposals, handoffs, or
-   audit rows in the current release.
+5. On explicit CLI/admin request, `auto-improve --dry-run` previews one
+   completed session with the configured LLM, while `auto-improve --stage`
+   stores validated `concepts/`, `decisions/`, `gotchas/`, `procedures/`, and
+   `_rules/` proposals in the pending-writes queue. The MCP
+   `memory_auto_improve` tool remains dry-run-only. Auto-improvement does not
+   run on SessionEnd by default and staged proposals do not become durable wiki
+   pages until an explicit pending-writes approval.
 6. `memory_query` answers via FTS5 + link-neighbour RRF; when an
    embedder is configured, vector cosine over `page_embeddings` joins
    the same RRF. If compiled wiki pages miss entirely, bounded raw
@@ -373,10 +375,9 @@ LLM_API_KEY                    accepted for openai embeddings only with a custom
 * **Scheduled consolidation queue.** Forget sweep and lint already run
   on the server's maintenance schedule; a future queue can compile
   session summaries outside hook latency.
-* **Auto-improvement staging.** The shipped reviewer is dry-run-only; future
-  work is durable pending proposal storage under `_pending/auto-improve/` plus
-  list/diff/approve/reject flows that keep autonomous proposal attribution
-  separate from the approving human or agent.
+* **Richer curator actions.** The shipped curator stages only one report page;
+  future work can add individual merge/supersession/link-fix proposals while
+  keeping deletes and semantic rewrites review-gated.
 * **Multi-workspace UI / web dashboard.** Out of scope for v1; revisit
   once the headless server has been load-tested.
 * **Real LongMemEval-S harness.** The recall-eval framework exists

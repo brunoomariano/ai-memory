@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Clarified architecture and auto-improvement design docs so CLI/admin
+  auto-improvement is described as dry-run by default with explicit staging and
+  pending-writes approval, while only the MCP tool remains dry-run-only.
+
 ## [1.0.8] - 2026-06-15
 
 ### Added
