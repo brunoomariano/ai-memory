@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-06-15
+
 ### Added
 - Added staged auto-improvement review: `ai-memory auto-improve --stage` and
   `POST /admin/auto-improve` stage mode store validated proposals in durable
@@ -1090,7 +1092,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.7...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.8...HEAD
+[1.0.8]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.8
 [1.0.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.7
 [1.0.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.6
 [1.0.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.5
