@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.11] - 2026-06-15
+
 ### Added
 - Added a server-side auto-improvement scheduler. When an LLM provider is
   configured, `[auto_improve.scheduler] enabled = true` reviews newly completed
@@ -1124,7 +1126,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.10...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.0.11...HEAD
+[1.0.11]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.11
 [1.0.10]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.10
 [1.0.9]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.9
 [1.0.8]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.0.8
