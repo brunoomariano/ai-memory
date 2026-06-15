@@ -29,8 +29,8 @@ pub use actor::{ActorContext, AuthLevel, AuthzError, Capability};
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{Handoff, HandoffState, NewHandoff};
 pub use ids::{
-    AgentKind, HandoffId, ObservationId, PageId, PagePath, ProjectId, SessionId, UserId,
-    WorkspaceId,
+    AgentKind, AutoImproveProposalId, AutoImproveRunId, HandoffId, ObservationId, PageId, PagePath,
+    ProjectId, SessionId, UserId, WorkspaceId,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{LinkTarget, NewPage, Page, Tier};

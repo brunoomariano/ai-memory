@@ -79,8 +79,12 @@ pub enum Command {
     ForgetSweep(ForgetSweepArgs),
     /// Run the M8 lint pass (stale / duplicates + optional LLM contradiction).
     Lint(LintArgs),
+    /// Run the rule-based curator report.
+    Curator(CuratorArgs),
     /// Dry-run an optional auto-improvement review for one completed session.
     AutoImprove(AutoImproveArgs),
+    /// Review, approve, or reject staged auto-improvement proposals.
+    PendingWrites(PendingWritesArgs),
     /// Compute + store embeddings for every latest page (M9).
     Embed(EmbedArgs),
     /// Generate a random hex bearer token for AI_MEMORY_AUTH_TOKEN.
@@ -854,12 +858,36 @@ pub struct LintArgs {
     pub project: Option<String>,
 }
 
+/// Arguments for `curator`.
+#[derive(Debug, Args)]
+pub struct CuratorArgs {
+    /// Return a report without staging a pending write. Default when no mode flag is set.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Stage one pending curator report page for approval.
+    #[arg(long)]
+    pub stage: bool,
+    /// Workspace name. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Emit only machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for `auto-improve`.
 #[derive(Debug, Args)]
 pub struct AutoImproveArgs {
-    /// Required for now. Staging/apply will ship after pending proposal storage.
+    /// Run reviewer without staging proposals.
     #[arg(long)]
     pub dry_run: bool,
+    /// Stage validated proposals for review.
+    #[arg(long)]
+    pub stage: bool,
     /// Completed session UUID to review.
     #[arg(long)]
     pub session_id: String,
@@ -889,6 +917,59 @@ pub struct AutoImproveArgs {
     #[arg(long)]
     pub include_raw_fallback: bool,
     /// Emit only the machine-readable JSON report.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PendingWritesArgs {
+    #[command(subcommand)]
+    pub command: PendingWritesCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PendingWritesCommand {
+    List(PendingWritesListArgs),
+    Show(PendingWriteIdArgs),
+    Diff(PendingWriteIdArgs),
+    Approve(PendingWriteIdArgs),
+    Reject(PendingWriteRejectArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PendingWritesListArgs {
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long)]
+    pub status: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PendingWriteIdArgs {
+    pub id: String,
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PendingWriteRejectArgs {
+    pub id: String,
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long, default_value = "rejected by reviewer")]
+    pub reason: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -1213,6 +1294,133 @@ mod tests {
         assert_eq!(args.session_id, "00000000-0000-0000-0000-000000000000");
         assert_eq!(args.max_proposals, Some(2));
         assert_eq!(args.project, None);
+    }
+
+    #[test]
+    fn curator_parses_default_dry_run_and_mode_flags() {
+        let cli = Cli::try_parse_from(["ai-memory", "curator", "--project", "scratch"])
+            .expect("curator parses without mode flags");
+        let Command::Curator(args) = cli.command else {
+            panic!("expected curator command");
+        };
+        assert!(!args.dry_run);
+        assert!(!args.stage);
+        assert_eq!(args.project.as_deref(), Some("scratch"));
+
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "curator",
+            "--dry-run",
+            "--workspace",
+            "default",
+        ])
+        .expect("curator dry-run parses");
+        let Command::Curator(args) = cli.command else {
+            panic!("expected curator command");
+        };
+        assert!(args.dry_run);
+        assert!(!args.stage);
+
+        let cli =
+            Cli::try_parse_from(["ai-memory", "curator", "--stage"]).expect("curator stage parses");
+        let Command::Curator(args) = cli.command else {
+            panic!("expected curator command");
+        };
+        assert!(args.stage);
+        assert!(!args.dry_run);
+    }
+
+    #[test]
+    fn auto_improve_stage_parses_required_session() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "auto-improve",
+            "--stage",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--project",
+            "scratch",
+        ])
+        .expect("auto-improve stage parses");
+
+        let Command::AutoImprove(args) = cli.command else {
+            panic!("expected auto-improve command");
+        };
+        assert!(args.stage);
+        assert!(!args.dry_run);
+        assert_eq!(args.project.as_deref(), Some("scratch"));
+    }
+
+    #[test]
+    fn pending_writes_subcommands_parse() {
+        let id = "00000000-0000-0000-0000-000000000000";
+        let list = Cli::try_parse_from([
+            "ai-memory",
+            "pending-writes",
+            "list",
+            "--project",
+            "scratch",
+            "--status",
+            "pending",
+            "--limit",
+            "5",
+        ])
+        .expect("pending-writes list parses");
+        let Command::PendingWrites(args) = list.command else {
+            panic!("expected pending-writes command");
+        };
+        let PendingWritesCommand::List(args) = args.command else {
+            panic!("expected list subcommand");
+        };
+        assert_eq!(args.project.as_deref(), Some("scratch"));
+        assert_eq!(args.status.as_deref(), Some("pending"));
+        assert_eq!(args.limit, 5);
+
+        for subcommand in ["show", "diff", "approve"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "pending-writes",
+                subcommand,
+                id,
+                "--project",
+                "scratch",
+            ])
+            .unwrap_or_else(|e| panic!("pending-writes {subcommand} parses: {e}"));
+            let Command::PendingWrites(args) = cli.command else {
+                panic!("expected pending-writes command");
+            };
+            match args.command {
+                PendingWritesCommand::Show(args)
+                | PendingWritesCommand::Diff(args)
+                | PendingWritesCommand::Approve(args) => {
+                    assert_eq!(args.id, id);
+                    assert_eq!(args.project.as_deref(), Some("scratch"));
+                }
+                PendingWritesCommand::List(_) | PendingWritesCommand::Reject(_) => {
+                    panic!("wrong subcommand parsed")
+                }
+            }
+        }
+
+        let reject = Cli::try_parse_from([
+            "ai-memory",
+            "pending-writes",
+            "reject",
+            id,
+            "--project",
+            "scratch",
+            "--reason",
+            "not now",
+        ])
+        .expect("pending-writes reject parses");
+        let Command::PendingWrites(args) = reject.command else {
+            panic!("expected pending-writes command");
+        };
+        let PendingWritesCommand::Reject(args) = args.command else {
+            panic!("expected reject subcommand");
+        };
+        assert_eq!(args.id, id);
+        assert_eq!(args.reason, "not now");
     }
 
     #[test]

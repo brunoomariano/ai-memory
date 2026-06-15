@@ -5,6 +5,7 @@
 //! - `POST /admin/bootstrap`      — ingest a pre-collected source bundle
 //!   into seed wiki pages via the configured LLM provider.
 //! - `POST /admin/auto-improve`   — dry-run durable wiki edit proposals for one session.
+//! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
@@ -33,16 +34,20 @@ use std::path::PathBuf;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Bootstrap, BootstrapConfig, BootstrapOutcome, BootstrapSource,
-    SourceCounts, prune_sources_to_budget, run_auto_improve_review, run_lint, run_sweep,
+    CuratorParams, CuratorReport, SourceCounts, prune_sources_to_budget,
+    render_curator_report_markdown, run_auto_improve_review, run_curator_report, run_lint,
+    run_sweep,
 };
 use ai_memory_core::{
-    ActiveProject, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME, PagePath, ProjectId,
-    SessionId, Tier, WorkspaceId,
+    ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
+    PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use ai_memory_store::{
-    DecayParams, EmbeddingWrite, ReaderPool, ScopeResolutionError, StoreError, WriterHandle,
-    create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope,
+    ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
+    DecayParams, EmbeddingWrite, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
+    ScopeResolutionError, StageAutoImproveRun, StoreError, WriterHandle, create_explicit_scope,
+    f32_vec_to_bytes, lookup_existing_scope,
 };
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
 use axum::Json;
@@ -165,6 +170,12 @@ struct AutoImproveRequest {
     /// available until pending proposal storage ships.
     #[serde(default)]
     dry_run: bool,
+    /// Stage validated proposals into the pending-review queue.
+    #[serde(default)]
+    stage: bool,
+    /// Optional mode alias (`dry_run` or `stage`).
+    #[serde(default)]
+    mode: Option<String>,
     /// Minimum observations before the LLM review runs.
     #[serde(default = "default_auto_improve_min_observations")]
     min_observations: usize,
@@ -189,6 +200,68 @@ struct AutoImproveRequest {
     /// Pending proposal folder reserved for future staging.
     #[serde(default = "default_auto_improve_pending_path")]
     pending_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AutoImproveStageResponse {
+    run_id: String,
+    proposal_ids: Vec<String>,
+    sidecar_paths: Vec<String>,
+    report: ai_memory_consolidate::AutoImproveReport,
+}
+
+/// JSON request body for `POST /admin/curator`.
+#[derive(Deserialize)]
+struct CuratorRequest {
+    /// Workspace name (must already exist).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (must already exist).
+    #[serde(default = "default_project")]
+    project: String,
+    /// Return a report without staging anything.
+    #[serde(default)]
+    dry_run: bool,
+    /// Stage one pending report page.
+    #[serde(default)]
+    stage: bool,
+    /// Optional mode alias (`dry_run` or `stage`).
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CuratorStageResponse {
+    run_id: String,
+    proposal_ids: Vec<String>,
+    sidecar_paths: Vec<String>,
+    report: CuratorReport,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingWritesQuery {
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default = "default_pending_writes_limit")]
+    limit: usize,
+}
+
+fn default_pending_writes_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingWriteScopeQuery {
+    workspace: String,
+    project: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingRejectRequest {
+    #[serde(default)]
+    reason: String,
 }
 
 fn default_auto_improve_min_observations() -> usize {
@@ -223,6 +296,7 @@ fn default_auto_improve_pending_path() -> String {
 /// - `POST /admin/backup`
 /// - `POST /admin/bootstrap`
 /// - `POST /admin/auto-improve`
+/// - `POST /admin/curator`
 /// - `GET  /admin/status`
 /// - `GET  /admin/search`
 /// - `GET  /admin/read-page`
@@ -245,6 +319,24 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/backup", post(handle_backup))
         .route("/admin/bootstrap", post(handle_bootstrap))
         .route("/admin/auto-improve", post(handle_auto_improve))
+        .route("/admin/curator", post(handle_curator))
+        .route("/admin/pending-writes", get(handle_pending_writes_list))
+        .route(
+            "/admin/pending-writes/{id}",
+            get(handle_pending_write_detail),
+        )
+        .route(
+            "/admin/pending-writes/{id}/diff",
+            get(handle_pending_write_diff),
+        )
+        .route(
+            "/admin/pending-writes/{id}/approve",
+            post(handle_pending_write_approve),
+        )
+        .route(
+            "/admin/pending-writes/{id}/reject",
+            post(handle_pending_write_reject),
+        )
         .route("/admin/status", get(handle_status))
         .route("/admin/search", get(handle_search))
         .route("/admin/read-page", get(handle_read_page))
@@ -915,12 +1007,29 @@ async fn handle_auto_improve(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<AutoImproveRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    if !req.dry_run {
+    let mode = req.mode.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let wants_stage = req.stage || matches!(mode, Some("stage"));
+    let wants_dry_run = req.dry_run || matches!(mode, Some("dry_run" | "dry-run"));
+    if wants_stage && wants_dry_run {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": "auto-improve currently supports --dry-run only; pending proposal storage is not implemented yet"
-            })),
+            Json(serde_json::json!({ "error": "choose either dry_run or stage, not both" })),
+        ));
+    }
+    if let Some(other) = mode
+        && !matches!(other, "stage" | "dry_run" | "dry-run")
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("unknown auto-improve mode '{other}'") })),
+        ));
+    }
+    if !wants_dry_run && !wants_stage {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(
+                serde_json::json!({ "error": "auto-improve requires dry_run=true or stage=true" }),
+            ),
         ));
     }
 
@@ -941,19 +1050,106 @@ async fn handle_auto_improve(
         max_input_tokens: req.max_input_tokens,
         max_proposals_per_run: req.max_proposals_per_run,
         include_raw_fallback: req.include_raw_fallback,
-        proposal_actor: req.proposal_actor,
-        pending_path: req.pending_path,
+        proposal_actor: req.proposal_actor.clone(),
+        pending_path: req.pending_path.clone(),
     };
 
-    run_auto_improve_review(&state.reader, &*llm, ws, proj, req.session_id, cfg)
+    let report = run_auto_improve_review(&state.reader, &*llm, ws, proj, req.session_id, cfg)
         .await
-        .map(|report| {
+        .map_err(auto_improve_error_response)?;
+    if wants_dry_run {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ));
+    }
+
+    let mut proposals = Vec::with_capacity(report.proposals.len());
+    for p in &report.proposals {
+        let path = PagePath::new(p.path.clone()).map_err(|e| {
             (
-                StatusCode::OK,
-                Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": format!("invalid proposal path: {e}") })),
             )
+        })?;
+        let operation = if state
+            .reader
+            .page_body_by_ids(ws, proj, path.as_str())
+            .await
+            .map_err(|e| internal_err(e.to_string()))?
+            .is_some()
+        {
+            AutoImproveProposalOperation::Update
+        } else {
+            AutoImproveProposalOperation::Create
+        };
+        proposals.push(NewAutoImproveProposal {
+            operation,
+            target_path: path,
+            kind: p.kind.clone(),
+            title: p.title.clone(),
+            confidence: f64::from(p.confidence),
+            rationale: p.rationale.clone(),
+            evidence_json: serde_json::to_value(&p.evidence)
+                .map_err(|e| internal_err(e.to_string()))?,
+            body_markdown: p.body_markdown.clone(),
+            artifact_sha256: None,
+        });
+    }
+    let staged = state
+        .writer
+        .stage_auto_improve_run(StageAutoImproveRun {
+            workspace_id: ws,
+            project_id: proj,
+            session_id: Some(req.session_id),
+            provider: Some(report.provider.clone()),
+            model: Some(report.model.clone()),
+            summary: Some(report.summary.clone()),
+            warnings_json: serde_json::to_value(&report.warnings)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
+                .unwrap_or_else(|_| serde_json::json!([])),
+            config_json: serde_json::json!({
+                "min_observations": req.min_observations,
+                "min_session_duration_secs": req.min_session_duration_secs,
+                "min_confidence": req.min_confidence,
+                "max_input_tokens": req.max_input_tokens,
+                "max_proposals_per_run": req.max_proposals_per_run,
+                "include_raw_fallback": req.include_raw_fallback,
+            }),
+            proposal_actor: ai_memory_core::ActorContext {
+                agent: Some(req.proposal_actor.clone()),
+                ..ai_memory_core::ActorContext::default()
+            },
+            proposals,
         })
-        .map_err(auto_improve_error_response)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let mut sidecar_paths = Vec::with_capacity(staged.proposal_ids.len());
+    for id in &staged.proposal_ids {
+        let path = state
+            .wiki
+            .write_auto_improve_sidecar(ws, proj, *id)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        sidecar_paths.push(path.display().to_string());
+    }
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(AutoImproveStageResponse {
+                run_id: staged.run_id.to_string(),
+                proposal_ids: staged
+                    .proposal_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                sidecar_paths,
+                report,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
 }
 
 fn auto_improve_error_response(
@@ -968,6 +1164,355 @@ fn auto_improve_error_response(
         AutoImproveError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(serde_json::json!({ "error": e.to_string() })))
+}
+
+// ---------------------------------------------------------------------
+// curator report
+// ---------------------------------------------------------------------
+
+async fn handle_curator(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<CuratorRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let mode = req.mode.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let wants_stage = req.stage || matches!(mode, Some("stage"));
+    let explicit_dry_run = req.dry_run || matches!(mode, Some("dry_run" | "dry-run"));
+    if wants_stage && explicit_dry_run {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "choose either dry_run or stage, not both" })),
+        ));
+    }
+    if let Some(other) = mode
+        && !matches!(other, "stage" | "dry_run" | "dry-run")
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("unknown curator mode '{other}'") })),
+        ));
+    }
+    let wants_dry_run = explicit_dry_run || !wants_stage;
+
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+    let params = CuratorParams::default();
+    let mut report = run_curator_report(
+        &state.reader,
+        ws,
+        proj,
+        &req.workspace,
+        &req.project,
+        params.clone(),
+    )
+    .await
+    .map_err(|e| internal_err(e.to_string()))?;
+    if wants_dry_run {
+        report.dry_run = true;
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ));
+    }
+
+    report.dry_run = false;
+    let body_markdown = render_curator_report_markdown(&report);
+    let target_path = curator_target_path();
+    let target = PagePath::new(target_path).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid curator target path: {e}") })),
+        )
+    })?;
+    let operation = if state
+        .reader
+        .page_body_by_ids(ws, proj, target.as_str())
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .is_some()
+    {
+        AutoImproveProposalOperation::Update
+    } else {
+        AutoImproveProposalOperation::Create
+    };
+
+    let staged = state
+        .writer
+        .stage_auto_improve_run(StageAutoImproveRun {
+            workspace_id: ws,
+            project_id: proj,
+            session_id: None,
+            provider: None,
+            model: None,
+            summary: Some(report.summary.clone()),
+            warnings_json: serde_json::json!([]),
+            rejected_candidates_json: serde_json::json!([]),
+            config_json: serde_json::json!({
+                "mode": "stage",
+                "curator": true,
+                "params": params,
+            }),
+            proposal_actor: ai_memory_core::ActorContext {
+                agent: Some("curator".into()),
+                ..ai_memory_core::ActorContext::default()
+            },
+            proposals: vec![NewAutoImproveProposal {
+                operation,
+                target_path: target,
+                kind: "curator_report".into(),
+                title: "Curator Report".into(),
+                confidence: 1.0,
+                rationale: "Rule-based curator report only; approval writes the report page and performs no maintenance actions.".into(),
+                evidence_json: serde_json::json!({
+                    "summary": report.summary.clone(),
+                    "findings": report.findings.clone(),
+                }),
+                body_markdown,
+                artifact_sha256: None,
+            }],
+        })
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let mut sidecar_paths = Vec::with_capacity(staged.proposal_ids.len());
+    for id in &staged.proposal_ids {
+        let path = state
+            .wiki
+            .write_auto_improve_sidecar(ws, proj, *id)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        sidecar_paths.push(path.display().to_string());
+    }
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(CuratorStageResponse {
+                run_id: staged.run_id.to_string(),
+                proposal_ids: staged
+                    .proposal_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                sidecar_paths,
+                report,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
+}
+
+fn curator_target_path() -> String {
+    let now = jiff::Timestamp::now().to_string();
+    let date = now.get(0..10).unwrap_or("latest");
+    format!("notes/curator-{date}.md")
+}
+
+async fn handle_pending_writes_list(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<PendingWritesQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let status = match query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => match raw.parse::<AutoImproveProposalStatus>() {
+            Ok(status) => Some(status),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                );
+            }
+        },
+        None => None,
+    };
+    match state
+        .reader
+        .list_auto_improve_proposals(ws, proj, status, query.limit.clamp(1, 200))
+        .await
+    {
+        Ok(list) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(list).unwrap_or_else(|_| serde_json::json!([]))),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+async fn pending_detail(
+    state: &AdminState,
+    raw_id: &str,
+    query: &PendingWriteScopeQuery,
+) -> Result<
+    (
+        WorkspaceId,
+        ProjectId,
+        ai_memory_store::AutoImproveProposalDetail,
+    ),
+    (StatusCode, Json<serde_json::Value>),
+> {
+    let id: AutoImproveProposalId = raw_id.parse().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid proposal id: {e}") })),
+        )
+    })?;
+    let (ws, proj) = lookup_ws_proj_no_create(state, &query.workspace, &query.project).await?;
+    let detail = state
+        .reader
+        .auto_improve_proposal_detail(ws, proj, id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "proposal not found in scope" })),
+            )
+        })?;
+    Ok((ws, proj, detail))
+}
+
+async fn handle_pending_write_detail(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<PendingWriteScopeQuery>,
+) -> impl IntoResponse {
+    match pending_detail(&state, &id, &query).await {
+        Ok((_, _, detail)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(detail).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(e) => e,
+    }
+}
+
+async fn handle_pending_write_diff(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<PendingWriteScopeQuery>,
+) -> impl IntoResponse {
+    match pending_detail(&state, &id, &query).await {
+        Ok((ws, proj, detail)) => {
+            let before = state
+                .reader
+                .page_body_by_ids(ws, proj, detail.summary.target_path.as_str())
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.body)
+                .unwrap_or_default();
+            let diff = format!(
+                "--- before/{path}\n+++ after/{path}\n@@\n{before}\n--- proposed ---\n{after}\n",
+                path = detail.summary.target_path.as_str(),
+                before = before,
+                after = detail.body_markdown
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "proposal_id": id, "diff": diff })),
+            )
+        }
+        Err(e) => e,
+    }
+}
+
+async fn handle_pending_write_approve(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<PendingWriteScopeQuery>,
+) -> impl IntoResponse {
+    let proposal_id: AutoImproveProposalId = match id.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid proposal id: {e}") })),
+            );
+        }
+    };
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
+    let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
+    let admission_ctx = Some(AdmissionContext {
+        op: AdmissionOp::WritePage,
+        skip_webhooks,
+        ..AdmissionContext::default()
+    });
+    match state
+        .wiki
+        .approve_auto_improve_proposal(ws, proj, proposal_id, actor, author_id, admission_ctx)
+        .await
+    {
+        Ok(ApproveAutoImproveProposalResult::Approved { page_id }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "approved", "page_id": page_id.to_string() })),
+        ),
+        Ok(ApproveAutoImproveProposalResult::Conflict) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "status": "conflict" })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+async fn handle_pending_write_reject(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<PendingWriteScopeQuery>,
+    Json(body): Json<PendingRejectRequest>,
+) -> impl IntoResponse {
+    let proposal_id: AutoImproveProposalId = match id.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid proposal id: {e}") })),
+            );
+        }
+    };
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    match state
+        .writer
+        .reject_auto_improve_proposal(RejectAutoImproveProposal {
+            workspace_id: ws,
+            project_id: proj,
+            proposal_id,
+            reason: body.reason,
+            actor,
+            author_id: author_ext.map(|axum::Extension(author_id)| author_id),
+        })
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "rejected" })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -3448,17 +3993,75 @@ fn map_user_store_err(e: ai_memory_store::StoreError) -> (StatusCode, Json<serde
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind};
+    use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult};
     use ai_memory_store::Store;
     use axum::body::to_bytes;
     use axum::http::Request;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
+    struct FakeAutoImproveLlm;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FakeAutoImproveLlm {
+        fn name(&self) -> &'static str {
+            "fake-auto-improve"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Ok(ChatResponse {
+                text: String::new(),
+                usage: None,
+                model: self.model().to_string(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "summary": "two staged proposals",
+                "proposals": [
+                    {
+                        "operation": "create_or_update",
+                        "path": "_slots/current-focus.md",
+                        "title": "Current Focus",
+                        "kind": "slot",
+                        "confidence": 0.95,
+                        "rationale": "The current focus should be updated from the session.",
+                        "evidence": [{"page":"session", "quote":"focus changed"}],
+                        "body_markdown": "# Current Focus\n\nupdated focus proposal"
+                    },
+                    {
+                        "operation": "create_or_update",
+                        "path": "notes/new-auto-improve.md",
+                        "title": "New Auto Improve Lesson",
+                        "kind": "note",
+                        "confidence": 0.93,
+                        "rationale": "The session contains a durable lesson worth adding.",
+                        "evidence": [{"page":"session", "quote":"durable lesson"}],
+                        "body_markdown": "# New Auto Improve Lesson\n\nnew page proposal"
+                    }
+                ],
+                "rejected_candidates": []
+            }))
+        }
+    }
+
     #[tokio::test]
     async fn status_reports_provider_health_block() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -3496,7 +4099,9 @@ mod tests {
     fn read_page_test_router() -> (TempDir, Router) {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
@@ -3514,6 +4119,84 @@ mod tests {
             on_project_moved: None,
         });
         (tmp, router)
+    }
+
+    fn admin_state_for_store(tmp: &TempDir, store: &Store, wiki: Wiki) -> AdminState {
+        admin_state_for_store_with_llm(tmp, store, wiki, None)
+    }
+
+    fn admin_state_for_store_with_llm(
+        tmp: &TempDir,
+        store: &Store,
+        wiki: Wiki,
+        llm: Option<Arc<dyn LlmProvider>>,
+    ) -> AdminState {
+        AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm,
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            on_project_moved: None,
+        }
+    }
+
+    async fn stage_pending_write(
+        store: &Store,
+        workspace: &str,
+        project: &str,
+        path: &str,
+        body: &str,
+    ) -> (WorkspaceId, ProjectId, AutoImproveProposalId) {
+        let ws = store
+            .writer
+            .get_or_create_workspace(workspace)
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, project, None)
+            .await
+            .unwrap();
+        let staged = store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: None,
+                provider: Some("test".into()),
+                model: Some("model".into()),
+                summary: Some("summary".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({"mode":"stage"}),
+                proposal_actor: ai_memory_core::ActorContext {
+                    agent: Some("auto_improve".into()),
+                    ..ai_memory_core::ActorContext::default()
+                },
+                proposals: vec![NewAutoImproveProposal {
+                    operation: AutoImproveProposalOperation::Create,
+                    target_path: PagePath::new(path).unwrap(),
+                    kind: "note".into(),
+                    title: "Pending title".into(),
+                    confidence: 0.9,
+                    rationale: "rationale".into(),
+                    evidence_json: serde_json::json!([{"source":"test"}]),
+                    body_markdown: body.into(),
+                    artifact_sha256: None,
+                }],
+            })
+            .await
+            .unwrap();
+        (ws, proj, staged.proposal_ids[0])
     }
 
     async fn post_write_page(router: &Router, ws: &str, project: &str, path: &str, body: &str) {
@@ -3590,7 +4273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_improve_rejects_non_dry_run_for_now() {
+    async fn auto_improve_rejects_missing_mode() {
         let (_tmp, router) = read_page_test_router();
 
         let resp = router
@@ -3620,7 +4303,7 @@ mod tests {
             json["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("dry-run")
+                .contains("dry_run=true or stage=true")
         );
     }
 
@@ -3649,6 +4332,473 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn auto_improve_stage_stages_rows_sidecars_and_concrete_operations() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_slots/current-focus.md").unwrap(),
+            frontmatter: serde_json::json!({"kind":"slot"}),
+            body: "# Current Focus\n\nold focus".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Current Focus".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "focus changed and durable lesson".into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+
+        let router = admin_router(admin_state_for_store_with_llm(
+            &tmp,
+            &store,
+            wiki,
+            Some(Arc::new(FakeAutoImproveLlm)),
+        ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "stage": true,
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let proposal_ids = json["proposal_ids"].as_array().unwrap();
+        assert_eq!(proposal_ids.len(), 2);
+        let sidecar_paths = json["sidecar_paths"].as_array().unwrap();
+        assert_eq!(sidecar_paths.len(), 2);
+        for path in sidecar_paths {
+            let path = path.as_str().unwrap();
+            assert!(
+                std::path::Path::new(path).exists(),
+                "sidecar file must be written: {path}"
+            );
+        }
+
+        let staged = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, Some(AutoImproveProposalStatus::Pending), 10)
+            .await
+            .unwrap();
+        assert_eq!(staged.len(), 2, "DB proposal rows must be staged");
+        let slot = staged
+            .iter()
+            .find(|p| p.target_path.as_str() == "_slots/current-focus.md")
+            .expect("slot proposal staged");
+        let note = staged
+            .iter()
+            .find(|p| p.target_path.as_str() == "notes/new-auto-improve.md")
+            .expect("note proposal staged");
+        assert_eq!(slot.operation, AutoImproveProposalOperation::Update);
+        assert_eq!(note.operation, AutoImproveProposalOperation::Create);
+
+        let existing = store
+            .reader
+            .page_body_by_ids(ws, proj, "_slots/current-focus.md")
+            .await
+            .unwrap()
+            .expect("existing target remains present");
+        assert_eq!(existing.body, "# Current Focus\n\nold focus");
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/new-auto-improve.md")
+                .await
+                .unwrap()
+                .is_none(),
+            "stage mode must not write absent target page"
+        );
+    }
+
+    #[tokio::test]
+    async fn curator_dry_run_returns_report_and_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/curator")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["workspace"], "default");
+        assert_eq!(json["project"], "scratch");
+        assert_eq!(json["dry_run"], true);
+        assert!(json["findings"].as_array().unwrap().is_empty());
+        assert!(
+            store
+                .reader
+                .list_auto_improve_proposals(ws, proj, None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "dry-run must not stage proposals"
+        );
+        assert!(
+            store
+                .reader
+                .list_pages("default", "scratch")
+                .await
+                .unwrap()
+                .is_empty(),
+            "dry-run must not write pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn curator_stage_creates_one_report_proposal_and_approval_writes_report_only() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/curator")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "stage": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let proposal_ids = json["proposal_ids"].as_array().unwrap();
+        assert_eq!(proposal_ids.len(), 1);
+        let sidecar_paths = json["sidecar_paths"].as_array().unwrap();
+        assert_eq!(sidecar_paths.len(), 1);
+        let sidecar_path = sidecar_paths[0].as_str().unwrap();
+        assert!(std::path::Path::new(sidecar_path).exists());
+
+        let staged = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, Some(AutoImproveProposalStatus::Pending), 10)
+            .await
+            .unwrap();
+        assert_eq!(staged.len(), 1);
+        let summary = &staged[0];
+        assert_eq!(summary.kind, "curator_report");
+        assert_eq!(summary.title, "Curator Report");
+        assert_eq!(summary.operation, AutoImproveProposalOperation::Create);
+        assert!(summary.target_path.as_str().starts_with("notes/curator-"));
+        assert!(summary.target_path.as_str().ends_with(".md"));
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, summary.target_path.as_str())
+                .await
+                .unwrap()
+                .is_none(),
+            "stage must not write target page"
+        );
+
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, summary.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.events[0].event, "staged");
+        assert_eq!(detail.events[0].actor_json["agent"], "curator");
+        assert!(detail.body_markdown.starts_with("# Curator Report"));
+        assert!(detail.body_markdown.contains("Report-only"));
+
+        let approve_resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{}/approve?workspace=default&project=scratch",
+                        summary.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approve_resp.status(), StatusCode::OK);
+        let page = store
+            .reader
+            .page_body_by_ids(ws, proj, summary.target_path.as_str())
+            .await
+            .unwrap()
+            .expect("approval writes curator report page");
+        assert!(page.body.starts_with("# Curator Report"));
+        assert_eq!(
+            store
+                .reader
+                .list_pages("default", "scratch")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_writes_list_detail_diff_and_reject_use_stored_proposal() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (_ws, _proj, proposal_id) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/pending.md",
+            "# Pending\n\nproposed body",
+        )
+        .await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let list_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/pending-writes?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["id"], proposal_id.to_string());
+        assert_eq!(list[0]["status"], "pending");
+
+        let detail_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/pending-writes/{proposal_id}?workspace=default&project=scratch"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_resp.status(), StatusCode::OK);
+        let body = to_bytes(detail_resp.into_body(), usize::MAX).await.unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail["summary"]["target_path"], "notes/pending.md");
+        assert_eq!(detail["body_markdown"], "# Pending\n\nproposed body");
+
+        let diff_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/pending-writes/{proposal_id}/diff?workspace=default&project=scratch"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(diff_resp.status(), StatusCode::OK);
+        let body = to_bytes(diff_resp.into_body(), usize::MAX).await.unwrap();
+        let diff: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(diff["diff"].as_str().unwrap().contains("proposed body"));
+
+        let reject_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{proposal_id}/reject?workspace=default&project=scratch"
+                    ))
+                    .header("content-type", "application/json")
+                    .extension(ai_memory_core::ActorContext {
+                        user: Some("reviewer".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    })
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({"reason":"not now"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reject_resp.status(), StatusCode::OK);
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(_ws, _proj, "notes/pending.md")
+                .await
+                .unwrap()
+                .is_none(),
+            "reject must not write the target page"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_write_approve_writes_stored_body() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, proposal_id) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/approved.md",
+            "# Stored\n\nfrom stored proposal",
+        )
+        .await;
+        wiki.write_auto_improve_sidecar(ws, proj, proposal_id)
+            .await
+            .unwrap();
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/pending-writes/{proposal_id}/approve?workspace=default&project=scratch"
+                    ))
+                    .extension(ai_memory_core::ActorContext {
+                        user: Some("reviewer".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page = store
+            .reader
+            .page_body_by_ids(ws, proj, "notes/approved.md")
+            .await
+            .unwrap()
+            .expect("approve writes target page");
+        assert_eq!(page.body, "# Stored\n\nfrom stored proposal");
     }
 
     #[tokio::test]
@@ -4258,10 +5408,40 @@ mod tests {
             ),
             (
                 "POST",
+                "/admin/curator",
+                serde_json::json!({"workspace": "default", "project": "scratch", "dry_run": true}),
+            ),
+            (
+                "POST",
                 "/admin/commit",
                 serde_json::json!({"message": "test"}),
             ),
             ("GET", "/admin/checkpoints?limit=1", serde_json::Value::Null),
+            (
+                "GET",
+                "/admin/pending-writes?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
+            (
+                "GET",
+                "/admin/pending-writes/00000000-0000-0000-0000-000000000000?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
+            (
+                "GET",
+                "/admin/pending-writes/00000000-0000-0000-0000-000000000000/diff?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
+            (
+                "POST",
+                "/admin/pending-writes/00000000-0000-0000-0000-000000000000/approve?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
+            (
+                "POST",
+                "/admin/pending-writes/00000000-0000-0000-0000-000000000000/reject?workspace=default&project=scratch",
+                serde_json::json!({"reason": "no"}),
+            ),
             (
                 "POST",
                 "/admin/restore-page",

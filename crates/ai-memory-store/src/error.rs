@@ -66,4 +66,12 @@ pub enum StoreError {
     /// description.
     #[error("os error: {0}")]
     Os(String),
+
+    /// A persisted row contains malformed data.
+    #[error("malformed record: {0}")]
+    MalformedRecord(String),
+
+    /// A requested state transition is not allowed.
+    #[error("invalid state: {0}")]
+    InvalidState(String),
 }

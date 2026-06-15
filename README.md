@@ -88,8 +88,8 @@ priors are at the [bottom](#influences-and-prior-art).
   [`[auto_scope]` modes](docs/auto-scope.md) for per-user or
   session-aware current-project routing.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `checkpoints`,
-  `restore-page`, `purge-project`, `rename-project`, `move-project`, `lint`,
-  `auto-improve --dry-run`, `embed`, `forget-sweep`, `backup` are
+    `restore-page`, `purge-project`, `rename-project`, `move-project`, `lint`,
+  `curator`, `auto-improve --dry-run`, `embed`, `forget-sweep`, `backup` are
   all HTTP clients of the running server - never touch SQLite or
   wiki files directly. `status` also reports passive LLM/embedding
   provider health from the last real provider call. Server is the
@@ -131,9 +131,16 @@ priors are at the [bottom](#influences-and-prior-art).
 - **"What durable lesson did that session teach?"**
   `ai-memory auto-improve --dry-run --session-id <uuid>` reviews one completed
   session with the configured LLM and returns validated proposed wiki edits. It
-  is report-only for now: no pending pages or durable wiki files are written.
-  Agents can also call `memory_auto_improve` to review the latest completed
-  session in the current project without knowing the session id.
+  writes nothing by default; `ai-memory auto-improve --stage --session-id <uuid>`
+  stores validated proposals in the pending-writes queue for later
+  `list`/`show`/`diff`/`approve`/`reject`. Agents can also call
+  `memory_auto_improve` to dry-run review the latest completed session in the
+  current project without knowing the session id.
+- **"What housekeeping should I consider?"**
+  `ai-memory curator` runs a no-LLM, rule-based maintenance report over cold
+  episodic pages, stale slots, duplicate exact normalized titles, and dangling
+  cross-project links. It defaults to dry-run; `--stage` queues one report page
+  for approval and still performs no maintenance actions itself.
 - **"Run one ai-memory for the whole household."** Stand the server
   up on a homelab box at `0.0.0.0:49374` with a bearer token; every
   laptop/desktop talks to it. Per-cwd routing keeps each project's

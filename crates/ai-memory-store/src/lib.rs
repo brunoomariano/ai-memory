@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+mod auto_improve;
 pub mod decay;
 mod error;
 mod fts_query;
@@ -24,6 +25,12 @@ mod writer;
 
 pub use fts_query::prepare_fts5_query;
 
+pub use auto_improve::{
+    ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
+    AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
+    AutoImproveProposalSummary, FailAutoImproveProposal, NewAutoImproveProposal,
+    RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun, artifact_path_for,
+};
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
 pub use ops::{EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
@@ -101,10 +108,11 @@ impl Store {
 mod tests {
     use super::*;
     use ai_memory_core::{
-        AgentKind, LinkTarget, NewObservation, NewPage, NewSession, ObservationId, ObservationKind,
-        PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+        ActorContext, AgentKind, LinkTarget, NewObservation, NewPage, NewSession, ObservationId,
+        ObservationKind, PageId, PagePath, ProjectId, SessionId, Tier, UserId, WorkspaceId,
     };
     use rusqlite::{Connection, params};
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
     fn sample_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> NewPage {
@@ -120,6 +128,704 @@ mod tests {
             links: Vec::new(),
             author_id: None,
         }
+    }
+
+    fn proposal(
+        path: &str,
+        op: AutoImproveProposalOperation,
+        body: &str,
+    ) -> NewAutoImproveProposal {
+        NewAutoImproveProposal {
+            operation: op,
+            target_path: PagePath::new(path).unwrap(),
+            kind: "note".into(),
+            title: "Proposed".into(),
+            confidence: 0.9,
+            rationale: "rationale".into(),
+            evidence_json: serde_json::json!([{"source":"test"}]),
+            body_markdown: body.into(),
+            artifact_sha256: None,
+        }
+    }
+
+    fn stage_input(
+        ws: WorkspaceId,
+        proj: ProjectId,
+        proposals: Vec<NewAutoImproveProposal>,
+    ) -> StageAutoImproveRun {
+        StageAutoImproveRun {
+            workspace_id: ws,
+            project_id: proj,
+            session_id: None,
+            provider: Some("test".into()),
+            model: Some("model".into()),
+            summary: Some("summary".into()),
+            warnings_json: serde_json::json!([]),
+            rejected_candidates_json: serde_json::json!([]),
+            config_json: serde_json::json!({"mode":"stage"}),
+            proposal_actor: ActorContext {
+                agent: Some("auto_improve".into()),
+                ..ActorContext::default()
+            },
+            proposals,
+        }
+    }
+
+    fn sha256(body: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(body.as_bytes());
+        hasher.finalize().into()
+    }
+
+    fn latest_snapshot(
+        db_path: &std::path::Path,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        path: &str,
+    ) -> (PageId, [u8; 32], i64) {
+        let conn = Connection::open(db_path).unwrap();
+        let (id, hash, updated): (Vec<u8>, Vec<u8>, i64) = conn.query_row(
+            "SELECT id, body_sha256, updated_at FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![ws.as_bytes(), proj.as_bytes(), path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        (
+            PageId::from_slice(&id).unwrap(),
+            hash.try_into().unwrap(),
+            updated,
+        )
+    }
+
+    #[tokio::test]
+    async fn auto_improve_migration_and_stage_persist_reopen_list_detail_scope() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let staged = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/a.md",
+                    AutoImproveProposalOperation::Create,
+                    "# A",
+                )],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(staged.proposal_ids.len(), 1);
+        let pending = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, Some(AutoImproveProposalStatus::Pending), 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target_path.as_str(), "notes/a.md");
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, staged.proposal_ids[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.events.len(), 1);
+        assert_eq!(
+            detail.artifact_path,
+            format!("_pending/auto-improve/{}.md", staged.proposal_ids[0])
+        );
+        assert!(
+            store
+                .reader
+                .auto_improve_proposal_detail(ws, other, staged.proposal_ids[0])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        let reopened = Store::open(tmp.path()).unwrap();
+        assert_eq!(
+            reopened
+                .reader
+                .list_auto_improve_proposals(ws, proj, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_reject_pending_only_records_event() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let id = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/r.md",
+                    AutoImproveProposalOperation::Create,
+                    "# R",
+                )],
+            ))
+            .await
+            .unwrap()
+            .proposal_ids[0];
+        let actor = ActorContext {
+            user: Some("reviewer".into()),
+            ..ActorContext::default()
+        };
+        store
+            .writer
+            .reject_auto_improve_proposal(RejectAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: id,
+                reason: "nope".into(),
+                actor: actor.clone(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.status, AutoImproveProposalStatus::Rejected);
+        assert_eq!(detail.decision_reason.as_deref(), Some("nope"));
+        assert_eq!(detail.events.last().unwrap().event, "rejected");
+        assert!(
+            store
+                .writer
+                .reject_auto_improve_proposal(RejectAutoImproveProposal {
+                    workspace_id: ws,
+                    project_id: proj,
+                    proposal_id: id,
+                    reason: "again".into(),
+                    actor,
+                    author_id: None
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_stage_derives_snapshots_and_validates_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/update.md", "old"))
+            .await
+            .unwrap();
+        let (latest_id, latest_hash, latest_updated) =
+            latest_snapshot(store.db_path(), ws, proj, "notes/update.md");
+        let staged = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![
+                    proposal(
+                        "notes/create.md",
+                        AutoImproveProposalOperation::Create,
+                        "new",
+                    ),
+                    proposal(
+                        "notes/update.md",
+                        AutoImproveProposalOperation::Update,
+                        "newer",
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+        let create = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, staged.proposal_ids[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(create.target_latest_page_id_at_stage.is_none());
+        assert!(create.target_body_sha256_at_stage.is_none());
+        assert!(create.target_updated_at_at_stage.is_none());
+        let update = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, staged.proposal_ids[1])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.target_latest_page_id_at_stage, Some(latest_id));
+        assert_eq!(update.target_body_sha256_at_stage, Some(latest_hash));
+        assert_eq!(update.target_updated_at_at_stage, Some(latest_updated));
+
+        assert!(
+            store
+                .writer
+                .stage_auto_improve_run(stage_input(
+                    ws,
+                    proj,
+                    vec![proposal(
+                        "notes/update.md",
+                        AutoImproveProposalOperation::Create,
+                        "bad"
+                    )],
+                ))
+                .await
+                .is_err()
+        );
+
+        let out_of_scope_session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: out_of_scope_session,
+                workspace_id: ws,
+                project_id: other,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        let mut input = stage_input(
+            ws,
+            proj,
+            vec![proposal(
+                "notes/session.md",
+                AutoImproveProposalOperation::Create,
+                "session",
+            )],
+        );
+        input.session_id = Some(out_of_scope_session);
+        assert!(store.writer.stage_auto_improve_run(input).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn auto_improve_duplicate_pending_target_rolls_back_run() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .stage_auto_improve_run(stage_input(
+                    ws,
+                    proj,
+                    vec![
+                        proposal("notes/dupe.md", AutoImproveProposalOperation::Create, "one"),
+                        proposal("notes/dupe.md", AutoImproveProposalOperation::Create, "two"),
+                    ],
+                ))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .reader
+                .list_auto_improve_proposals(ws, proj, None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_fail_pending_only_records_event() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let id = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/fail.md",
+                    AutoImproveProposalOperation::Create,
+                    "fail",
+                )],
+            ))
+            .await
+            .unwrap()
+            .proposal_ids[0];
+        let actor = ActorContext {
+            agent: Some("admission".into()),
+            ..ActorContext::default()
+        };
+        store
+            .writer
+            .fail_auto_improve_proposal(FailAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: id,
+                reason: "admission denied".into(),
+                actor: actor.clone(),
+                author_id: None,
+            })
+            .await
+            .unwrap();
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.status, AutoImproveProposalStatus::Failed);
+        assert_eq!(detail.events.last().unwrap().event, "failed");
+        assert!(
+            store
+                .writer
+                .fail_auto_improve_proposal(FailAutoImproveProposal {
+                    workspace_id: ws,
+                    project_id: proj,
+                    proposal_id: id,
+                    reason: "again".into(),
+                    actor,
+                    author_id: None,
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_approve_upserts_page_and_conflicts_are_sql_atomic() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let actor = ActorContext {
+            user: Some("approver".into()),
+            ..ActorContext::default()
+        };
+
+        let create_id = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/new.md",
+                    AutoImproveProposalOperation::Create,
+                    "approved body",
+                )],
+            ))
+            .await
+            .unwrap()
+            .proposal_ids[0];
+        let result = store
+            .writer
+            .approve_auto_improve_proposal(ApproveAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: create_id,
+                page: sample_page(ws, proj, "notes/new.md", "approved body"),
+                actor: actor.clone(),
+                author_id: None,
+                checkpoint: Some("ck".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ApproveAutoImproveProposalResult::Approved { .. }
+        ));
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, create_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.status, AutoImproveProposalStatus::Approved);
+        assert!(detail.applied_page_id.is_some());
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/new.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "approved body"
+        );
+
+        let stale_create = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/existing.md",
+                    AutoImproveProposalOperation::Create,
+                    "proposal",
+                )],
+            ))
+            .await
+            .unwrap()
+            .proposal_ids[0];
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/existing.md", "external"))
+            .await
+            .unwrap();
+        let conflict = store
+            .writer
+            .approve_auto_improve_proposal(ApproveAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: stale_create,
+                page: sample_page(ws, proj, "notes/existing.md", "proposal"),
+                actor: actor.clone(),
+                author_id: None,
+                checkpoint: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(conflict, ApproveAutoImproveProposalResult::Conflict);
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/existing.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "external"
+        );
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/update.md", "old"))
+            .await
+            .unwrap();
+        let update = proposal(
+            "notes/update.md",
+            AutoImproveProposalOperation::Update,
+            "new",
+        );
+        let update_id = store
+            .writer
+            .stage_auto_improve_run(stage_input(ws, proj, vec![update]))
+            .await
+            .unwrap()
+            .proposal_ids[0];
+        store
+            .writer
+            .upsert_page(sample_page(
+                ws,
+                proj,
+                "notes/update.md",
+                "changed elsewhere",
+            ))
+            .await
+            .unwrap();
+        let conflict = store
+            .writer
+            .approve_auto_improve_proposal(ApproveAutoImproveProposal {
+                workspace_id: ws,
+                project_id: proj,
+                proposal_id: update_id,
+                page: sample_page(ws, proj, "notes/update.md", "new"),
+                actor,
+                author_id: None,
+                checkpoint: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(conflict, ApproveAutoImproveProposalResult::Conflict);
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/update.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "changed elsewhere"
+        );
+        assert_eq!(
+            sha256("approved body"),
+            latest_snapshot(store.db_path(), ws, proj, "notes/new.md").1
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_approval_rejects_mismatched_page_author() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let proposal_id = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/author.md",
+                    AutoImproveProposalOperation::Create,
+                    "body",
+                )],
+            ))
+            .await
+            .unwrap()
+            .proposal_ids[0];
+        let mut page = sample_page(ws, proj, "notes/author.md", "body");
+        page.author_id = Some(UserId::new());
+        assert!(
+            store
+                .writer
+                .approve_auto_improve_proposal(ApproveAutoImproveProposal {
+                    workspace_id: ws,
+                    project_id: proj,
+                    proposal_id,
+                    page,
+                    actor: ActorContext::default(),
+                    author_id: None,
+                    checkpoint: None,
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/author.md")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_project_move_restamps_proposal_scope() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let src_ws = store
+            .writer
+            .get_or_create_workspace("source")
+            .await
+            .unwrap();
+        let dst_ws = store.writer.get_or_create_workspace("dest").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(src_ws, "app", None)
+            .await
+            .unwrap();
+        let proposal_id = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                src_ws,
+                proj,
+                vec![proposal(
+                    "notes/move.md",
+                    AutoImproveProposalOperation::Create,
+                    "move",
+                )],
+            ))
+            .await
+            .unwrap()
+            .proposal_ids[0];
+        let summary = store
+            .writer
+            .move_project_workspace(proj, src_ws, dst_ws)
+            .await
+            .unwrap();
+        assert_eq!(summary.auto_improve_runs_moved, 1);
+        assert_eq!(summary.auto_improve_proposals_moved, 1);
+        assert!(
+            store
+                .reader
+                .auto_improve_proposal_detail(src_ws, proj, proposal_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .reader
+                .auto_improve_proposal_detail(dst_ws, proj, proposal_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

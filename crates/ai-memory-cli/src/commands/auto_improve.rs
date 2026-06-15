@@ -2,7 +2,7 @@
 
 use ai_memory_consolidate::AutoImproveReport;
 use anyhow::{Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::AutoImproveArgs;
 use crate::config::Config;
@@ -15,6 +15,7 @@ struct AutoImproveRequest {
     project: String,
     session_id: String,
     dry_run: bool,
+    stage: bool,
     min_observations: usize,
     min_session_duration_secs: u64,
     min_confidence: f32,
@@ -25,16 +26,22 @@ struct AutoImproveRequest {
     pending_path: String,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct StageResponse {
+    run_id: String,
+    proposal_ids: Vec<String>,
+    sidecar_paths: Vec<String>,
+    report: AutoImproveReport,
+}
+
 /// Run the `auto-improve` subcommand.
 ///
 /// # Errors
 /// Returns an error if the command is not explicitly dry-run, if the server is
 /// unreachable, or if the server rejects the review request.
 pub async fn run(config: &Config, args: AutoImproveArgs) -> Result<()> {
-    if !args.dry_run {
-        bail!(
-            "auto-improve currently supports only --dry-run; pending proposal storage is not implemented yet"
-        );
+    if args.dry_run == args.stage {
+        bail!("choose exactly one of --dry-run or --stage");
     }
 
     let endpoint = ServerEndpoint::from_config(config);
@@ -44,7 +51,8 @@ pub async fn run(config: &Config, args: AutoImproveArgs) -> Result<()> {
         workspace: args.workspace,
         project: project.clone(),
         session_id: args.session_id,
-        dry_run: true,
+        dry_run: args.dry_run,
+        stage: args.stage,
         min_observations: args.min_observations.unwrap_or(settings.min_observations),
         min_session_duration_secs: args
             .min_session_duration_secs
@@ -57,13 +65,30 @@ pub async fn run(config: &Config, args: AutoImproveArgs) -> Result<()> {
         pending_path: settings.pending_path.clone(),
     };
 
-    let report: AutoImproveReport = post_json(&endpoint, "/admin/auto-improve", &request).await?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    if args.stage {
+        let response: StageResponse = post_json(&endpoint, "/admin/auto-improve", &request).await?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        } else {
+            println!("Staged auto-improve run {}", response.run_id);
+            for (id, path) in response
+                .proposal_ids
+                .iter()
+                .zip(response.sidecar_paths.iter())
+            {
+                println!("  - {id}: {path}");
+            }
+        }
     } else {
-        print_human_report(&report, &project);
-        println!("\n--- machine-readable ---");
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let report: AutoImproveReport =
+            post_json(&endpoint, "/admin/auto-improve", &request).await?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print_human_report(&report, &project);
+            println!("\n--- machine-readable ---");
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
     }
     Ok(())
 }

@@ -65,9 +65,9 @@ ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
 
-The CLI commands (`bootstrap`, `status`, `search`, `lint`, `auto-improve
---dry-run`, etc.) inherit the two env vars automatically. So do `install-mcp`,
-`install-hooks`, and
+The CLI commands (`bootstrap`, `status`, `search`, `lint`, `auto-improve`,
+`curator`, `pending-writes`, etc.) inherit the two env vars automatically. So do
+`install-mcp`, `install-hooks`, and
 `setup-agent`: with `AI_MEMORY_SERVER_URL` set, `install-mcp` derives the
 `/mcp` endpoint and `install-hooks` uses the bare server origin.
 

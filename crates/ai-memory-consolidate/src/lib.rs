@@ -11,6 +11,7 @@
 pub mod auto_improve;
 pub mod bootstrap;
 pub mod consolidator;
+pub mod curator;
 pub mod lint;
 pub mod sweep;
 pub mod types;
@@ -31,6 +32,10 @@ pub use bootstrap::{
 };
 pub use consolidator::{
     BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult, build_batch_request,
+};
+pub use curator::{
+    CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,
+    run_curator_report,
 };
 pub use lint::{LintError, LintFinding, LintReport, run_lint};
 pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep};

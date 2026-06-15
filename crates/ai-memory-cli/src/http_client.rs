@@ -188,9 +188,23 @@ pub async fn post_json<B: Serialize, T: DeserializeOwned>(
     path: &str,
     body: &B,
 ) -> Result<T> {
+    post_json_with_query(endpoint, path, &[], body).await
+}
+
+/// POST JSON body to `<endpoint>{path}` with URL-encoded query params.
+///
+/// # Errors
+/// Same as [`post_json`].
+pub async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    query: &[(&str, &str)],
+    body: &B,
+) -> Result<T> {
     let client = reqwest::Client::new();
-    let url = endpoint.build_url(path);
-    let req = endpoint.authenticate(client.post(&url).json(body));
+    let url = build_url_with_query(endpoint, path, query)?;
+    let req = client.post(&url);
+    let req = endpoint.authenticate(req.json(body));
     let resp = req
         .send()
         .await
@@ -203,6 +217,18 @@ pub async fn post_json<B: Serialize, T: DeserializeOwned>(
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from POST {url}"))
+}
+
+fn build_url_with_query(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Result<String> {
+    let mut url = reqwest::Url::parse(&endpoint.build_url(path))?;
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query.iter().copied());
+    }
+    Ok(url.to_string())
 }
 
 /// Turn a low-level reqwest connect/timeout error into a friendlier
@@ -452,6 +478,21 @@ mod tests {
                 "http://127.0.0.1:49374/admin/status"
             );
         }
+    }
+
+    #[test]
+    fn build_url_with_query_url_encodes_values() {
+        let ep = ServerEndpoint::from_pair(Some("http://h:49374/wiki".to_string()), None);
+        let url = super::build_url_with_query(
+            &ep,
+            "/admin/pending-writes/id/approve",
+            &[("workspace", "default workspace"), ("project", "a/b & c")],
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "http://h:49374/wiki/admin/pending-writes/id/approve?workspace=default+workspace&project=a%2Fb+%26+c"
+        );
     }
 
     // ----------------------------------------------------------------

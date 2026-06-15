@@ -249,10 +249,11 @@ restore              reindex              install-hooks
 hook                 install-mcp          commit
 checkpoints          restore-page         llm-test
 forget-sweep         lint                 auto-improve
-embed                generate-auth-token  setup-agent
-bootstrap            install-instructions reorg
-purge-project        rename-project       move-project
-uninstall            auth                 user
+curator              pending-writes       embed
+generate-auth-token  setup-agent          bootstrap
+install-instructions reorg                purge-project
+rename-project       move-project         uninstall
+auth                 user
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -316,9 +317,9 @@ mu = 0.04                          # ↑ if recent hits should count more
 cold_threshold = 0.20              # below this → soft-delete
 hard_delete_after_days = 180
 
-[auto_improve]                     # default-available, non-mutating review
+[auto_improve]                     # default-available, review-gated proposals
 enabled = true
-mode = "dry_run"                   # stage / auto_apply are future modes
+mode = "dry_run"                   # CLI/admin stage is explicit; no auto-apply
 on_session_end = false             # hooks never gain LLM latency on upgrade
 min_observations = 8
 min_session_duration_secs = 120

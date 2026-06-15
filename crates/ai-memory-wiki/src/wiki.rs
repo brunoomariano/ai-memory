@@ -3,9 +3,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ai_memory_core::{NewPage, PageId, PagePath, ProjectId, Sanitizer, Tier, WorkspaceId};
+use ai_memory_core::{
+    ActorContext, AutoImproveProposalId, NewPage, PageId, PagePath, ProjectId, Sanitizer, Tier,
+    UserId, WorkspaceId,
+};
 use ai_memory_llm::Embedder;
-use ai_memory_store::{MoveSummary, ReaderPool, WriterHandle, f32_vec_to_bytes};
+use ai_memory_store::{
+    ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
+    FailAutoImproveProposal, MoveSummary, ReaderPool, WriterHandle, artifact_path_for,
+    f32_vec_to_bytes,
+};
 use tokio::sync::RwLock;
 
 use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
@@ -13,6 +20,7 @@ use crate::atomic;
 use crate::error::{WikiError, WikiResult};
 use crate::git::{Checkpoint, GitAdapter};
 use crate::markdown::{Markdown, derive_title, emit, extract_links, parse};
+use crate::watcher::is_pending_path;
 
 /// Summary of a [`Wiki::reindex_all`] run.
 #[derive(Debug, Default, Clone)]
@@ -572,6 +580,165 @@ impl Wiki {
         &self.writer
     }
 
+    /// Absolute on-disk path for an auto-improvement proposal sidecar.
+    #[must_use]
+    pub fn auto_improve_sidecar_path(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        proposal_id: AutoImproveProposalId,
+    ) -> PathBuf {
+        self.project_root(workspace_id, project_id)
+            .join(artifact_path_for(proposal_id))
+    }
+
+    /// Write a human-reviewable non-indexed sidecar for a staged proposal.
+    ///
+    /// This intentionally bypasses [`Self::write_page`]: pending proposal
+    /// artifacts are review aids, not durable wiki pages, and must not create
+    /// rows in `pages`/FTS/embeddings.
+    pub async fn write_auto_improve_sidecar(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        proposal_id: AutoImproveProposalId,
+    ) -> WikiResult<PathBuf> {
+        let reader = self.store_reader.as_ref().ok_or_else(|| {
+            ai_memory_wiki_error("auto-improve sidecar write requires a store reader")
+        })?;
+        let detail = reader
+            .auto_improve_proposal_detail(workspace_id, project_id, proposal_id)
+            .await?
+            .ok_or_else(|| ai_memory_wiki_error("auto-improve proposal not found in scope"))?;
+        let path = self.auto_improve_sidecar_path(workspace_id, project_id, proposal_id);
+        let content = self.sanitizer.scrub(&render_auto_improve_sidecar(&detail)?);
+        let _guard = self.mutation_lock.read().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+        atomic::write_atomic(&path, content.as_bytes())?;
+        Ok(path)
+    }
+
+    /// Approve a staged auto-improvement proposal by applying its stored body
+    /// through the normal wiki write pipeline, then atomically marking the DB
+    /// proposal approved.
+    pub async fn approve_auto_improve_proposal(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        proposal_id: AutoImproveProposalId,
+        actor: ActorContext,
+        author_id: Option<UserId>,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<ApproveAutoImproveProposalResult> {
+        let reader = self
+            .store_reader
+            .as_ref()
+            .ok_or_else(|| ai_memory_wiki_error("auto-improve approval requires a store reader"))?;
+        let detail = reader
+            .auto_improve_proposal_detail(workspace_id, project_id, proposal_id)
+            .await?
+            .ok_or_else(|| ai_memory_wiki_error("auto-improve proposal not found in scope"))?;
+
+        let path = detail.summary.target_path.clone();
+        let mut frontmatter = serde_json::json!({
+            "kind": detail.summary.kind,
+            "title": detail.summary.title,
+            "auto_improve_proposal_id": proposal_id.to_string(),
+            "auto_improve_run_id": detail.summary.run_id.to_string(),
+        });
+        frontmatter = stamp_last_modified_by(frontmatter, &actor);
+        let body = self.sanitizer.scrub(&detail.body_markdown);
+        let mut markdown = Markdown { frontmatter, body };
+        let mut resolved_ctx = None;
+        if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.actor = actor.clone();
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            match chain.run(&path, &mut markdown, &ctx).await {
+                Ok(()) => resolved_ctx = Some(ctx),
+                Err(e) => {
+                    let reason = e.to_string();
+                    self.writer
+                        .fail_auto_improve_proposal(FailAutoImproveProposal {
+                            workspace_id,
+                            project_id,
+                            proposal_id,
+                            reason,
+                            actor,
+                            author_id,
+                        })
+                        .await?;
+                    return Err(e);
+                }
+            }
+        }
+        markdown.body = self.sanitizer.scrub(&markdown.body);
+        scrub_frontmatter_strings(&mut markdown.frontmatter, &self.sanitizer);
+        let title = self.sanitizer.scrub(&detail.summary.title);
+        let links = extract_links(&markdown.body, &path);
+        let emitted = emit(&markdown)?;
+        let page = NewPage {
+            workspace_id,
+            project_id,
+            path: path.clone(),
+            title,
+            body: markdown.body.clone(),
+            tier: Tier::Semantic,
+            frontmatter_json: markdown.frontmatter.clone(),
+            pinned: is_slot_path(&path),
+            links,
+            author_id,
+        };
+
+        let result = {
+            let _guard = self.mutation_lock.write().await;
+            self.ensure_project_workspace(workspace_id, project_id)
+                .await?;
+            let abs = self.abs_path(workspace_id, project_id, &path);
+            let installed = replace_file_with_rollback_snapshot(&abs, emitted.as_bytes())?;
+            match self
+                .writer
+                .approve_auto_improve_proposal(ApproveAutoImproveProposal {
+                    workspace_id,
+                    project_id,
+                    proposal_id,
+                    page,
+                    actor: actor.clone(),
+                    author_id,
+                    checkpoint: None,
+                })
+                .await
+            {
+                Ok(ApproveAutoImproveProposalResult::Approved { page_id }) => {
+                    ApproveAutoImproveProposalResult::Approved { page_id }
+                }
+                Ok(ApproveAutoImproveProposalResult::Conflict) => {
+                    rollback_or_inconsistent(
+                        std::slice::from_ref(&installed),
+                        &"proposal conflict",
+                    )?;
+                    ApproveAutoImproveProposalResult::Conflict
+                }
+                Err(e) => {
+                    rollback_or_inconsistent(std::slice::from_ref(&installed), &e)?;
+                    return Err(e.into());
+                }
+            }
+        };
+
+        if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+            chain.dispatch_async(
+                Some(path.as_str()),
+                &markdown.frontmatter,
+                &markdown.body,
+                ctx,
+            );
+        }
+        Ok(result)
+    }
+
     /// Re-index the page on disk at `path` into the store *without*
     /// rewriting the file.
     ///
@@ -588,6 +755,11 @@ impl Wiki {
         project_id: ProjectId,
         path: PagePath,
     ) -> WikiResult<PageId> {
+        if is_pending_path(&path) {
+            return Err(ai_memory_wiki_error(
+                "refusing to index pending proposal sidecar",
+            ));
+        }
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
@@ -1130,6 +1302,37 @@ fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
     crate::WikiError::Io(std::io::Error::other(msg.to_string()))
 }
 
+fn render_auto_improve_sidecar(detail: &AutoImproveProposalDetail) -> WikiResult<String> {
+    let evidence = serde_json::to_string_pretty(&detail.evidence_json)?;
+    Ok(format!(
+        "# Pending auto-improvement proposal\n\n\
+         - proposal_id: `{}`\n\
+         - run_id: `{}`\n\
+         - status: `{}`\n\
+         - operation: `{}`\n\
+         - target_path: `{}`\n\
+         - kind: `{}`\n\
+         - title: `{}`\n\
+         - confidence: `{}`\n\
+         - staged_at: `{}`\n\n\
+         ## Rationale\n\n{}\n\n\
+         ## Evidence\n\n```json\n{}\n```\n\n\
+         ## Proposed body\n\n{}\n",
+        detail.summary.id,
+        detail.summary.run_id,
+        detail.summary.status.as_str(),
+        detail.summary.operation.as_str(),
+        detail.summary.target_path.as_str(),
+        detail.summary.kind,
+        detail.summary.title,
+        detail.summary.confidence,
+        detail.summary.staged_at,
+        detail.rationale,
+        evidence,
+        detail.body_markdown,
+    ))
+}
+
 #[derive(Debug)]
 struct InstalledFile {
     path: PathBuf,
@@ -1295,7 +1498,11 @@ fn is_slot_path(path: &PagePath) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_store::Store;
+    use crate::admission::{FailurePolicy, WebhookConfig};
+    use ai_memory_store::{
+        AutoImproveProposalOperation, AutoImproveProposalStatus, NewAutoImproveProposal,
+        StageAutoImproveRun, Store,
+    };
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -1377,6 +1584,383 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
         }
+    }
+
+    fn proposal(
+        path: &str,
+        op: AutoImproveProposalOperation,
+        body: &str,
+    ) -> NewAutoImproveProposal {
+        NewAutoImproveProposal {
+            operation: op,
+            target_path: PagePath::new(path).unwrap(),
+            kind: "note".into(),
+            title: "Proposed".into(),
+            confidence: 0.9,
+            rationale: "test rationale".into(),
+            evidence_json: serde_json::json!([{ "source": "test" }]),
+            body_markdown: body.into(),
+            artifact_sha256: None,
+        }
+    }
+
+    fn proposal_with_fields(
+        path: &str,
+        body: &str,
+        rationale: &str,
+        evidence_json: serde_json::Value,
+    ) -> NewAutoImproveProposal {
+        NewAutoImproveProposal {
+            rationale: rationale.into(),
+            evidence_json,
+            ..proposal(path, AutoImproveProposalOperation::Create, body)
+        }
+    }
+
+    async fn stage_one(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        path: &str,
+        body: &str,
+    ) -> AutoImproveProposalId {
+        stage_one_op(
+            store,
+            ws,
+            proj,
+            proposal(path, AutoImproveProposalOperation::Create, body),
+        )
+        .await
+    }
+
+    async fn stage_one_op(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        proposal: NewAutoImproveProposal,
+    ) -> AutoImproveProposalId {
+        store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: None,
+                provider: Some("test".into()),
+                model: Some("model".into()),
+                summary: Some("summary".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                proposal_actor: ActorContext {
+                    agent: Some("auto_improve".into()),
+                    ..ActorContext::default()
+                },
+                proposals: vec![proposal],
+            })
+            .await
+            .unwrap()
+            .proposal_ids[0]
+    }
+
+    async fn scoped(tmp: &TempDir) -> (Store, Wiki, WorkspaceId, ProjectId) {
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        (store, wiki, ws, proj)
+    }
+
+    #[tokio::test]
+    async fn auto_improve_sidecar_writes_non_indexed_review_file() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let id = stage_one(&store, ws, proj, "notes/proposed.md", "proposed body").await;
+        let sidecar = wiki.write_auto_improve_sidecar(ws, proj, id).await.unwrap();
+        assert_eq!(
+            sidecar,
+            wiki.project_root(ws, proj)
+                .join(format!("_pending/auto-improve/{id}.md"))
+        );
+        let content = std::fs::read_to_string(sidecar).unwrap();
+        assert!(content.contains("Pending auto-improvement proposal"));
+        assert!(content.contains("proposed body"));
+        assert!(
+            store
+                .reader
+                .search_pages_for_project(ws, proj, "proposed body".into(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_sidecar_scrubs_stored_proposal_secrets() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let id = stage_one_op(
+            &store,
+            ws,
+            proj,
+            proposal_with_fields(
+                "notes/leaky-proposal.md",
+                "body has ANTHROPIC_API_KEY=sk-ant-leak-1234567890abcdef",
+                "rationale has postgres://admin:hunter2@db.internal/prod",
+                serde_json::json!([{ "secret": "GH_TOKEN=ghp_1234567890abcdef1234567890abcdef1234" }]),
+            ),
+        )
+        .await;
+        let sidecar = wiki.write_auto_improve_sidecar(ws, proj, id).await.unwrap();
+        let content = std::fs::read_to_string(sidecar).unwrap();
+        assert!(content.contains("[REDACTED]"));
+        assert!(!content.contains("sk-ant-leak"));
+        assert!(!content.contains("hunter2"));
+        assert!(!content.contains("ghp_"));
+    }
+
+    #[tokio::test]
+    async fn reindex_page_refuses_pending_auto_improve_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("_pending/auto-improve/x.md").unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "---\ntitle: pending\n---\nbody").unwrap();
+        assert!(wiki.reindex_page(ws, proj, path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn auto_improve_approval_writes_target_and_marks_approved() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let id = stage_one(&store, ws, proj, "notes/approved.md", "approved body").await;
+        let result = wiki
+            .approve_auto_improve_proposal(
+                ws,
+                proj,
+                id,
+                ActorContext {
+                    user: Some("reviewer".into()),
+                    ..ActorContext::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ApproveAutoImproveProposalResult::Approved { .. }
+        ));
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/approved.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "approved body"
+        );
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.status, AutoImproveProposalStatus::Approved);
+        assert_eq!(detail.events[0].event, "staged");
+        assert_eq!(detail.events[0].actor_json["agent"], "auto_improve");
+        assert_eq!(detail.events.last().unwrap().event, "approved");
+        assert_eq!(detail.events.last().unwrap().actor_json["user"], "reviewer");
+    }
+
+    #[tokio::test]
+    async fn auto_improve_approval_update_path_supersedes_existing_page() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/update-proposal.md",
+            "old body",
+            serde_json::json!({ "title": "Old" }),
+        ))
+        .await
+        .unwrap();
+        let id = stage_one_op(
+            &store,
+            ws,
+            proj,
+            proposal(
+                "notes/update-proposal.md",
+                AutoImproveProposalOperation::Update,
+                "new proposal body",
+            ),
+        )
+        .await;
+        let result = wiki
+            .approve_auto_improve_proposal(ws, proj, id, ActorContext::default(), None, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ApproveAutoImproveProposalResult::Approved { .. }
+        ));
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/update-proposal.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "new proposal body"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_approval_admission_mutation_is_persisted_and_scrubbed() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/mutate",
+            post(|Json(_payload): Json<serde_json::Value>| async move {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "page": { "body": "mutated ANTHROPIC_API_KEY=sk-ant-leak-1234567890abcdef" }
+                    })),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "mutator".into(),
+                url: format!("http://{addr}/mutate"),
+                timeout_ms: 1000,
+                failure_policy: FailurePolicy::Reject,
+                events: vec![AdmissionOp::WritePage],
+                blocking: true,
+            }])
+            .unwrap(),
+        );
+        let id = stage_one(&store, ws, proj, "notes/mutated.md", "original body").await;
+        wiki.approve_auto_improve_proposal(ws, proj, id, ActorContext::default(), None, None)
+            .await
+            .unwrap();
+        let stored = store
+            .reader
+            .page_body_by_ids(ws, proj, "notes/mutated.md")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.body.contains("[REDACTED]"));
+        assert!(!stored.body.contains("sk-ant-leak"));
+        assert!(
+            std::fs::read_to_string(wiki.abs_path(
+                ws,
+                proj,
+                &PagePath::new("notes/mutated.md").unwrap()
+            ))
+            .unwrap()
+            .contains("[REDACTED]")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_approval_conflict_rolls_back_target_file() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let id = stage_one(&store, ws, proj, "notes/conflict.md", "proposal body").await;
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/conflict.md",
+            "external body",
+            serde_json::json!({ "title": "External" }),
+        ))
+        .await
+        .unwrap();
+        let result = wiki
+            .approve_auto_improve_proposal(ws, proj, id, ActorContext::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(result, ApproveAutoImproveProposalResult::Conflict);
+        assert!(
+            std::fs::read_to_string(wiki.abs_path(
+                ws,
+                proj,
+                &PagePath::new("notes/conflict.md").unwrap()
+            ))
+            .unwrap()
+            .contains("external body")
+        );
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "notes/conflict.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "external body"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_admission_rejection_marks_failed_without_writing_target() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "rejector".into(),
+                url: "http://127.0.0.1:9/reject".into(),
+                timeout_ms: 50,
+                failure_policy: FailurePolicy::Reject,
+                events: vec![AdmissionOp::WritePage],
+                blocking: true,
+            }])
+            .unwrap(),
+        );
+        let id = stage_one(&store, ws, proj, "notes/rejected.md", "body").await;
+        assert!(
+            wiki.approve_auto_improve_proposal(ws, proj, id, ActorContext::default(), None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            !wiki
+                .abs_path(ws, proj, &PagePath::new("notes/rejected.md").unwrap())
+                .exists()
+        );
+        let detail = store
+            .reader
+            .auto_improve_proposal_detail(ws, proj, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.status, AutoImproveProposalStatus::Failed);
+        assert_eq!(detail.events.last().unwrap().event, "failed");
     }
 
     #[tokio::test]

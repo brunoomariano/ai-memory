@@ -231,6 +231,9 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         let Some((ws, proj, page_path)) = extract_project_ids(wiki.root(), raw_path) else {
             continue;
         };
+        if is_pending_path(&page_path) {
+            continue;
+        }
         if is_reserved_page_file(raw_path, &page_path) {
             continue;
         }
@@ -407,11 +410,21 @@ pub(crate) fn walk_markdown(root: &Path) -> WikiResult<Vec<PagePath>> {
                 continue;
             }
             if ft.is_dir() {
+                if path
+                    .strip_prefix(root)
+                    .ok()
+                    .and_then(|rel| rel.components().next())
+                    .and_then(|c| c.as_os_str().to_str())
+                    .is_some_and(|segment| segment == "_pending")
+                {
+                    continue;
+                }
                 stack.push(path);
             } else if ft.is_file()
                 && is_markdown(&path)
                 && !is_tempfile(&path)
                 && let Some(pp) = page_path_relative_to(root, &path)
+                && !is_pending_path(&pp)
                 && !is_reserved_page_file(&path, &pp)
             {
                 out.push(pp);
@@ -419,6 +432,10 @@ pub(crate) fn walk_markdown(root: &Path) -> WikiResult<Vec<PagePath>> {
         }
     }
     Ok(out)
+}
+
+pub(crate) fn is_pending_path(page_path: &PagePath) -> bool {
+    page_path.as_str() == "_pending" || page_path.as_str().starts_with("_pending/")
 }
 
 fn is_markdown(path: &Path) -> bool {
@@ -806,6 +823,23 @@ mod tests {
 
         handle.shutdown().await;
         drop(store);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn walk_markdown_skips_pending_auto_improve_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        let proj_root = tmp.path().join("proj");
+        std::fs::create_dir_all(proj_root.join("_pending/auto-improve")).unwrap();
+        std::fs::write(proj_root.join("real.md"), "real content\n").unwrap();
+        std::fs::write(
+            proj_root.join("_pending/auto-improve/proposal.md"),
+            "pending sidecar token\n",
+        )
+        .unwrap();
+
+        let found = walk_markdown(&proj_root).unwrap();
+        let names: Vec<_> = found.iter().map(|p| p.as_str().to_string()).collect();
+        assert_eq!(names, vec!["real.md".to_string()]);
     }
 
     /// A page that *collides* with a reserved ledger name (`log.md`) but

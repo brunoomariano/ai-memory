@@ -317,15 +317,19 @@ or confidence below the configured threshold.
 
 ## Pending Review UX
 
-The first useful UX can be simple. The dry-run command is implemented; staging
-and approval commands remain future work. The MCP dry-run tool is also
-implemented so agents can ask for a learning review without shelling out.
+The first production UX is explicit and review-gated. The CLI/admin dry-run
+path previews proposals, `--stage` stores validated pending proposals, and
+`pending-writes` applies or rejects them later. The MCP tool remains dry-run
+only so agents can ask for a learning review without gaining an approval/apply
+surface.
 
 | Command or route | Purpose |
 |---|---|
 | `ai-memory auto-improve --dry-run` | Preview proposals for a project/session. |
 | `memory_auto_improve` | MCP dry-run preview for the latest completed session or a named session. |
 | `ai-memory auto-improve --stage` | Store pending proposals without applying. |
+| `ai-memory curator` | Rule-based, report-only maintenance review. Defaults to dry-run. |
+| `ai-memory curator --stage` | Stage exactly one curator report page for pending-writes approval. |
 | `ai-memory pending-writes list` | Show staged wiki changes. |
 | `ai-memory pending-writes diff <id>` | Show markdown diff. |
 | `ai-memory pending-writes approve <id>` | Apply through the normal wiki mutation path. |
@@ -356,8 +360,11 @@ The maintenance loop should handle:
 5. Broken cross-references and contradiction candidates already surfaced by
    `memory_lint`.
 
-The maintenance loop should start as report-only. Later it can stage merge or
-supersession proposals. It should not auto-delete semantic pages.
+The maintenance loop starts as report-only. `ai-memory curator --stage` stages
+one normal report page under `notes/curator-<date>.md`; approving it records the
+report only and does not perform the recommended maintenance actions. Later it
+can stage merge or supersession proposals. It should not auto-delete semantic
+pages.
 
 ## Implementation Phases
 

@@ -17,6 +17,10 @@ use ai_memory_core::{
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::auto_improve::{
+    ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, FailAutoImproveProposal,
+    RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
+};
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{self, EmbeddingWrite, MoveSummary, PurgeSummary, ReorgSummary};
 use crate::users::{self, TOKEN_HASH_LEN};
@@ -189,6 +193,22 @@ pub(crate) enum WriteCmd {
     TouchUserLastSeen {
         user_id: UserId,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    StageAutoImproveRun {
+        input: StageAutoImproveRun,
+        reply: oneshot::Sender<StoreResult<StagedAutoImproveRun>>,
+    },
+    RejectAutoImproveProposal {
+        input: RejectAutoImproveProposal,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    FailAutoImproveProposal {
+        input: FailAutoImproveProposal,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    ApproveAutoImproveProposal {
+        input: ApproveAutoImproveProposal,
+        reply: oneshot::Sender<StoreResult<ApproveAutoImproveProposalResult>>,
     },
     Shutdown,
 }
@@ -788,6 +808,50 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Stage one auto-improvement run and all proposals in one SQL transaction.
+    pub async fn stage_auto_improve_run(
+        &self,
+        input: StageAutoImproveRun,
+    ) -> StoreResult<StagedAutoImproveRun> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::StageAutoImproveRun { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Reject a pending auto-improvement proposal and append an event.
+    pub async fn reject_auto_improve_proposal(
+        &self,
+        input: RejectAutoImproveProposal,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RejectAutoImproveProposal { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Mark a pending auto-improvement proposal failed and append an event.
+    pub async fn fail_auto_improve_proposal(
+        &self,
+        input: FailAutoImproveProposal,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::FailAutoImproveProposal { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Approve a pending auto-improvement proposal in a DB-only transaction.
+    pub async fn approve_auto_improve_proposal(
+        &self,
+        input: ApproveAutoImproveProposal,
+    ) -> StoreResult<ApproveAutoImproveProposalResult> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ApproveAutoImproveProposal { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     async fn send(&self, cmd: WriteCmd) -> StoreResult<()> {
         self.inner
             .tx
@@ -1056,6 +1120,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::TouchUserLastSeen { user_id, reply } => {
                 let result = users::touch_user_last_seen(&conn, user_id);
                 send_or_warn(reply, result, "touch_user_last_seen");
+            }
+            WriteCmd::StageAutoImproveRun { input, reply } => {
+                let result = crate::auto_improve::stage_run(&mut conn, &input);
+                send_or_warn(reply, result, "stage_auto_improve_run");
+            }
+            WriteCmd::RejectAutoImproveProposal { input, reply } => {
+                let result = crate::auto_improve::reject_proposal(&mut conn, &input);
+                send_or_warn(reply, result, "reject_auto_improve_proposal");
+            }
+            WriteCmd::FailAutoImproveProposal { input, reply } => {
+                let result = crate::auto_improve::fail_proposal(&mut conn, &input);
+                send_or_warn(reply, result, "fail_auto_improve_proposal");
+            }
+            WriteCmd::ApproveAutoImproveProposal { input, reply } => {
+                let result = crate::auto_improve::approve_proposal(&mut conn, &input);
+                send_or_warn(reply, result, "approve_auto_improve_proposal");
             }
         }
     }

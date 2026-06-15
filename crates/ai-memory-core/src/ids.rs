@@ -84,6 +84,8 @@ id_newtype!(pub ObservationId, "Identifier for a single observation captured dur
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
+id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
+id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
 
 /// Relative path of a page within the wiki tree.
 ///

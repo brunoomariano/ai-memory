@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added staged auto-improvement review: `ai-memory auto-improve --stage` and
+  `POST /admin/auto-improve` stage mode store validated proposals in durable
+  SQLite-backed pending-write rows with non-indexed `_pending/auto-improve/`
+  sidecars. The new `ai-memory pending-writes list|show|diff|approve|reject`
+  commands and `/admin/pending-writes*` routes let operators review, apply, or
+  reject those stored proposal bodies through the normal wiki mutation path.
+- Added first-release curator support: `ai-memory curator` and
+  `POST /admin/curator` run a rule-based, no-LLM, report-only maintenance
+  review for an existing workspace/project. Dry-run is the default and writes
+  nothing; `--stage` creates exactly one pending report proposal for approval
+  through the existing pending-writes queue, without editing pages, deleting
+  content, rewriting links, or changing slots.
+
 ## [1.0.7] - 2026-06-15
 
 ### Added

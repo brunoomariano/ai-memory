@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_core::{
-    AgentKind, Handoff, HandoffId, HandoffState, Observation, ObservationId, ObservationKind,
-    PageId, PagePath, ProjectId, SessionId, User, UserId, WorkspaceId,
+    AgentKind, AutoImproveProposalId, Handoff, HandoffId, HandoffState, Observation, ObservationId,
+    ObservationKind, PageId, PagePath, ProjectId, SessionId, User, UserId, WorkspaceId,
 };
 use parking_lot::Mutex;
 use rusqlite::types::Value;
@@ -22,6 +22,10 @@ use serde::Serialize;
 // DecayCandidate struct definition above to avoid a top-level import
 // for a single use-site.
 
+use crate::auto_improve::{
+    AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalStatus,
+    AutoImproveProposalSummary, bytes32, opt_bytes32, summary_from_row, to_sql_err,
+};
 use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
 use crate::users::TOKEN_HASH_LEN;
@@ -2882,6 +2886,165 @@ impl ReaderPool {
                 )
                 .optional()?;
             Ok(row)
+        })
+        .await
+    }
+
+    /// List auto-improvement proposals for one scope, optionally filtered by status.
+    pub async fn list_auto_improve_proposals(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        status: Option<AutoImproveProposalStatus>,
+        limit: usize,
+    ) -> StoreResult<Vec<AutoImproveProposalSummary>> {
+        self.with_conn(move |conn| {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let sql = if status.is_some() {
+                "SELECT id, run_id, workspace_id, project_id, status, operation, target_path, \
+                        kind, title, confidence, staged_at, decided_at \
+                 FROM auto_improve_proposals \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND status = ?3 \
+                 ORDER BY staged_at DESC LIMIT ?4"
+            } else {
+                "SELECT id, run_id, workspace_id, project_id, status, operation, target_path, \
+                        kind, title, confidence, staged_at, decided_at \
+                 FROM auto_improve_proposals \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                 ORDER BY staged_at DESC LIMIT ?3"
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let mut out = Vec::new();
+            if let Some(status) = status {
+                let rows = stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        status.as_str(),
+                        limit
+                    ],
+                    summary_from_row,
+                )?;
+                for row in rows {
+                    out.push(row?);
+                }
+            } else {
+                let rows = stmt.query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), limit],
+                    summary_from_row,
+                )?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Read one proposal by id, failing closed when the scope does not match.
+    pub async fn auto_improve_proposal_detail(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        proposal_id: AutoImproveProposalId,
+    ) -> StoreResult<Option<AutoImproveProposalDetail>> {
+        self.with_conn(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT id, run_id, workspace_id, project_id, status, operation, target_path, \
+                            kind, title, confidence, staged_at, decided_at, rationale, \
+                            evidence_json, body_markdown, body_sha256, artifact_path, \
+                            artifact_sha256, target_latest_page_id_at_stage, \
+                            target_body_sha256_at_stage, target_updated_at_at_stage, \
+                            decision_reason, decided_by_author_id, decided_by_actor_json, \
+                            applied_page_id, checkpoint \
+                     FROM auto_improve_proposals \
+                     WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+                    params![
+                        proposal_id.as_bytes(),
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                    ],
+                    |row| {
+                        let summary = summary_from_row(row)?;
+                        let evidence_raw: String = row.get(13)?;
+                        let body_hash = bytes32(row.get(15)?).map_err(to_sql_err)?;
+                        let artifact_hash = opt_bytes32(row.get(17)?).map_err(to_sql_err)?;
+                        let staged_page_id = row
+                            .get::<_, Option<Vec<u8>>>(18)?
+                            .map(|b| PageId::from_slice(&b))
+                            .transpose()
+                            .map_err(to_sql_err)?;
+                        let staged_body_hash = opt_bytes32(row.get(19)?).map_err(to_sql_err)?;
+                        let decided_author = row
+                            .get::<_, Option<Vec<u8>>>(22)?
+                            .map(|b| UserId::from_slice(&b))
+                            .transpose()
+                            .map_err(to_sql_err)?;
+                        let decided_actor_raw: Option<String> = row.get(23)?;
+                        let applied_page_id = row
+                            .get::<_, Option<Vec<u8>>>(24)?
+                            .map(|b| PageId::from_slice(&b))
+                            .transpose()
+                            .map_err(to_sql_err)?;
+                        Ok(AutoImproveProposalDetail {
+                            summary,
+                            rationale: row.get(12)?,
+                            evidence_json: serde_json::from_str(&evidence_raw)
+                                .map_err(to_sql_err)?,
+                            body_markdown: row.get(14)?,
+                            body_sha256: body_hash,
+                            artifact_path: row.get(16)?,
+                            artifact_sha256: artifact_hash,
+                            target_latest_page_id_at_stage: staged_page_id,
+                            target_body_sha256_at_stage: staged_body_hash,
+                            target_updated_at_at_stage: row.get(20)?,
+                            decision_reason: row.get(21)?,
+                            decided_by_author_id: decided_author,
+                            decided_by_actor_json: decided_actor_raw
+                                .map(|raw| serde_json::from_str(&raw))
+                                .transpose()
+                                .map_err(to_sql_err)?,
+                            applied_page_id,
+                            checkpoint: row.get(25)?,
+                            events: Vec::new(),
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(mut detail) = row else {
+                return Ok(None);
+            };
+            let mut stmt = conn.prepare(
+                "SELECT id, proposal_id, event, actor_json, author_id, detail_json, at \
+                 FROM auto_improve_proposal_events \
+                 WHERE proposal_id = ?1 ORDER BY at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map(params![proposal_id.as_bytes()], |row| {
+                let proposal_id = AutoImproveProposalId::from_slice(&row.get::<_, Vec<u8>>(1)?)
+                    .map_err(to_sql_err)?;
+                let actor_raw: String = row.get(3)?;
+                let detail_raw: String = row.get(5)?;
+                let author_id = row
+                    .get::<_, Option<Vec<u8>>>(4)?
+                    .map(|b| UserId::from_slice(&b))
+                    .transpose()
+                    .map_err(to_sql_err)?;
+                Ok(AutoImproveProposalEvent {
+                    id: row.get(0)?,
+                    proposal_id,
+                    event: row.get(2)?,
+                    actor_json: serde_json::from_str(&actor_raw).map_err(to_sql_err)?,
+                    author_id,
+                    detail_json: serde_json::from_str(&detail_raw).map_err(to_sql_err)?,
+                    at: row.get(6)?,
+                })
+            })?;
+            for row in rows {
+                detail.events.push(row?);
+            }
+            Ok(Some(detail))
         })
         .await
     }

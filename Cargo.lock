@@ -180,6 +180,7 @@ dependencies = [
  "ai-memory-store",
  "ai-memory-wiki",
  "anyhow",
+ "async-trait",
  "axum",
  "flate2",
  "jiff",

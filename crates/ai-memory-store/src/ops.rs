@@ -297,7 +297,7 @@ pub(crate) fn path_search_text(path: &str) -> String {
     format!("{segments} {words}")
 }
 
-fn upsert_page_in_tx(
+pub(crate) fn upsert_page_in_tx(
     tx: &rusqlite::Transaction<'_>,
     page: &NewPage,
     now: i64,
@@ -1153,6 +1153,10 @@ pub struct MoveSummary {
     pub handoffs_moved: u64,
     /// `audit_log` rows re-stamped.
     pub audit_log_moved: u64,
+    /// `auto_improve_runs` rows re-stamped.
+    pub auto_improve_runs_moved: u64,
+    /// `auto_improve_proposals` rows re-stamped.
+    pub auto_improve_proposals_moved: u64,
 }
 
 /// Re-stamp a project's `workspace_id` across every domain table in ONE
@@ -1206,6 +1210,14 @@ pub fn move_project_workspace(
         "UPDATE audit_log SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
+    let auto_improve_runs_moved = tx.execute(
+        "UPDATE auto_improve_runs SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )? as u64;
+    let auto_improve_proposals_moved = tx.execute(
+        "UPDATE auto_improve_proposals SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )? as u64;
 
     let projects_updated = tx.execute(
         "UPDATE projects SET workspace_id = ?1 WHERE id = ?2 AND workspace_id = ?3",
@@ -1224,6 +1236,8 @@ pub fn move_project_workspace(
         observations_moved,
         handoffs_moved,
         audit_log_moved,
+        auto_improve_runs_moved,
+        auto_improve_proposals_moved,
     })
 }
 
