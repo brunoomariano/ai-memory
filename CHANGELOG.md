@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Unscoped MCP queries could resolve to the wrong project on a shared
+  install. The cwd-to-project resolver recorded the bare working directory
+  as a project's `repo_path` whenever the cwd was not inside a git repo
+  (which, under the default basename strategy, was always), so opening a
+  session in a broad ancestor such as `$HOME` created a row that
+  prefix-matched every project nested beneath it and captured their unscoped
+  lookups. `repo_path` is now the git working directory containing the cwd,
+  or unset when the cwd is not inside a git repo, never the bare cwd. A
+  read-time guard additionally refuses to prefix-match a stored `repo_path`
+  equal to the operator's `$HOME`, and `ai-memory serve` heals existing
+  installs on startup by clearing any `repo_path` equal to `$HOME` or the
+  filesystem root. (issue #103)
+
 ## [1.1.0] - 2026-06-16
 
 ### Fixed
