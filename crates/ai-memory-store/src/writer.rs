@@ -563,9 +563,10 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// NULL out catch-all project `repo_path` rows ($HOME and filesystem
-    /// root) so existing installs self-heal on upgrade. Idempotent;
-    /// returns the number of rows healed.
+    /// NULL out catch-all project `repo_path` rows so existing installs
+    /// self-heal on upgrade: the broad sentinels (`$HOME` and the filesystem
+    /// root) plus any path that exists locally but is not a git work-tree
+    /// root. Idempotent; returns the number of rows healed.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.

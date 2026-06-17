@@ -79,10 +79,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
 
     // One-shot legacy heal (issue #103): NULL out any project repo_path that
-    // is a known prefix-match catch-all ($HOME or filesystem root) so existing
-    // broken installs self-correct on upgrade. Uses the same $HOME source as
-    // the router's match-time guard (captured once in `Config`) so heal and
-    // guard agree on its meaning.
+    // is a prefix-match catch-all. That means the $HOME and filesystem-root
+    // sentinels, plus any path that exists locally but is not a git work-tree
+    // root, so existing broken installs self-correct on upgrade. Uses the same
+    // $HOME source as the router's match-time guard (captured once in `Config`)
+    // so heal and guard agree on its meaning.
     let healed = store
         .writer
         .heal_catch_all_repo_paths(config.home_dir.clone())
@@ -90,7 +91,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     if healed > 0 {
         tracing::info!(
             healed,
-            "healed catch-all project repo_path rows ($HOME / filesystem root)"
+            "healed catch-all project repo_path rows ($HOME, filesystem root, or non-git-root path)"
         );
     }
 
