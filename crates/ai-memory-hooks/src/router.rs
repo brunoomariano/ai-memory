@@ -178,6 +178,11 @@ pub struct HookState {
     /// session close stays cheap; the LLM checkpoint otherwise happens on
     /// PreCompact and via manual `memory_consolidate`.
     pub consolidate_on_session_end: bool,
+    /// Operator home directory, sourced from `Config` once at startup. The
+    /// cwd->project resolver never prefix-matches a stored `repo_path` equal
+    /// to this, so `$HOME` cannot become a catch-all (issue #103). `None`
+    /// disables the guard. Held here so the hooks crate makes no env reads.
+    pub home_dir: Option<String>,
 }
 
 /// Build a router with `POST /hook` (event ingress) and `GET /handoff`
@@ -506,12 +511,11 @@ async fn resolve_project_ids(
     // The match is keyed on the actual cwd (`cwd_norm`), not the stored
     // `repo_path`: `repo_path` is now the git root or None (issue #103),
     // whereas cwd->parent matching needs the full deep path.
-    let home_dir = std::env::var("HOME").ok();
     let proj = if project_override.is_none()
         && let Some(rp) = cwd_norm.as_deref().filter(|s| !s.is_empty())
         && let Some((parent_id, parent_name)) = state
             .reader
-            .find_project_by_cwd_prefix(ws, rp.to_string(), home_dir.as_deref())
+            .find_project_by_cwd_prefix(ws, rp.to_string(), state.home_dir.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("find_project_by_cwd_prefix: {e}"))?
         && parent_name != project_name
@@ -947,6 +951,7 @@ mod tests {
             project_cache: Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default())),
             active_project: ActiveProject::new(),
             consolidate_on_session_end: false,
+            home_dir: None,
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),

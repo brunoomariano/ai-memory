@@ -81,10 +81,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     // One-shot legacy heal (issue #103): NULL out any project repo_path that
     // is a known prefix-match catch-all ($HOME or filesystem root) so existing
     // broken installs self-correct on upgrade. Uses the same $HOME source as
-    // the router's match-time guard so heal and guard agree on its meaning.
+    // the router's match-time guard (captured once in `Config`) so heal and
+    // guard agree on its meaning.
     let healed = store
         .writer
-        .heal_catch_all_repo_paths(std::env::var("HOME").ok())
+        .heal_catch_all_repo_paths(config.home_dir.clone())
         .await?;
     if healed > 0 {
         tracing::info!(
@@ -281,6 +282,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
                 )),
                 consolidate_on_session_end: config.consolidate_on_session_end,
+                home_dir: config.home_dir.clone(),
             });
             let admin = admin_router(AdminState {
                 writer: store.writer.clone(),
