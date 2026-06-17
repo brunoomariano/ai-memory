@@ -197,9 +197,11 @@ fn should_heal_repo_path(repo_path: &str, home: Option<&str>) -> bool {
     }
     let p = std::path::Path::new(repo_path);
     // Non-existent paths (and stat errors) are left alone: multi-user/unmounted
-    // safety. An existing path is a catch-all unless it is a git work-tree root
-    // (a normal repo has a `.git` dir, a worktree/submodule a `.git` file).
-    matches!(p.try_exists(), Ok(true)) && !p.join(".git").exists()
+    // safety. An existing path is a catch-all only when its `.git` is
+    // definitively absent (a normal repo has a `.git` dir, a worktree/submodule
+    // a `.git` file); a `.git` stat error preserves the row, same as the
+    // path-existence check above.
+    matches!(p.try_exists(), Ok(true)) && matches!(p.join(".git").try_exists(), Ok(false))
 }
 
 fn scheduler_state_table_exists(conn: &Connection) -> StoreResult<bool> {
