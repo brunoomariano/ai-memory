@@ -382,6 +382,14 @@ impl Wiki {
                 .get("pinned")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+        // Derive tier from the restored frontmatter (same fix as reindex_page):
+        // hardcoding Semantic here would flip an episodic page's tier on restore.
+        let tier = md
+            .frontmatter
+            .get("tier")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Tier>().ok())
+            .unwrap_or(Tier::Semantic);
 
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
@@ -399,7 +407,7 @@ impl Wiki {
                 path,
                 title,
                 body: md.body,
-                tier: Tier::Semantic,
+                tier,
                 frontmatter_json: md.frontmatter,
                 pinned,
                 links,
@@ -767,7 +775,24 @@ impl Wiki {
         let md = self.read_page(workspace_id, project_id, &path)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = extract_links(&md.body, &path);
-        let pinned = is_slot_path(&path);
+        // Derive tier/pinned from the on-disk frontmatter instead of hardcoding
+        // Semantic/is_slot_path. The watcher calls reindex_page on every page
+        // every ~30s; hardcoding clobbered episodic session pages to semantic
+        // (so they never decayed) and dropped the frontmatter `pinned` flag,
+        // also churning a spurious page version per write. Mirrors the pinned
+        // derivation already used by restore_page_from_checkpoint, plus tier.
+        let pinned = is_slot_path(&path)
+            || md
+                .frontmatter
+                .get("pinned")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        let tier = md
+            .frontmatter
+            .get("tier")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Tier>().ok())
+            .unwrap_or(Tier::Semantic);
         let id = self
             .writer
             .upsert_page(NewPage {
@@ -776,7 +801,7 @@ impl Wiki {
                 path,
                 title,
                 body: md.body,
-                tier: Tier::Semantic,
+                tier,
                 frontmatter_json: md.frontmatter,
                 pinned,
                 links,
@@ -1737,6 +1762,60 @@ mod tests {
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
         std::fs::write(&abs, "---\ntitle: pending\n---\nbody").unwrap();
         assert!(wiki.reindex_page(ws, proj, path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reindex_page_derives_tier_and_pinned_from_frontmatter() {
+        // Regression: the watcher's reindex_page must honour the on-disk
+        // frontmatter tier/pinned (as synth.rs writes for session pages),
+        // not hardcode Tier::Semantic / is_slot_path. Hardcoding flipped
+        // episodic session pages to semantic (so they never decayed) and
+        // dropped the frontmatter pin, churning a spurious version per write.
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+
+        // Episodic + pinned page on disk, exactly like a synth session page.
+        let path = PagePath::new("sessions/abc.md").unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "---\ntitle: S\ntier: episodic\npinned: true\n---\nbody").unwrap();
+
+        let id1 = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        let meta = store
+            .reader
+            .page_meta("default", "scratch", path.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            meta.tier, "episodic",
+            "reindex must keep the frontmatter tier, not force semantic"
+        );
+        assert!(meta.pinned, "reindex must keep the frontmatter pinned flag");
+
+        // Idempotent: re-running on the unchanged file must not supersede.
+        let id2 = wiki.reindex_page(ws, proj, path).await.unwrap();
+        assert_eq!(
+            id1, id2,
+            "reindex of an unchanged page must be a no-op (no spurious version)"
+        );
+
+        // Backward-compat: a page with no tier in frontmatter defaults to semantic.
+        let plain = PagePath::new("notes/plain.md").unwrap();
+        let pabs = wiki.abs_path(ws, proj, &plain);
+        std::fs::create_dir_all(pabs.parent().unwrap()).unwrap();
+        std::fs::write(&pabs, "---\ntitle: P\n---\nbody").unwrap();
+        wiki.reindex_page(ws, proj, plain.clone()).await.unwrap();
+        let pmeta = store
+            .reader
+            .page_meta("default", "scratch", plain.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pmeta.tier, "semantic",
+            "a page without a frontmatter tier must default to semantic"
+        );
     }
 
     #[tokio::test]
