@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (default 32 events).
 
 ### Fixed
+- Bounded heuristic session-page raw observation dumps and single-page
+  consolidation prompts so very large sessions cannot re-include unbounded
+  `## Raw observations` history (issue #102).
 - Hook spool no longer counts a server `429` (saturation / `hook queue full`)
   against a spooled event's `MAX_ATTEMPTS` retry budget: transient backpressure
   keeps the event queued without burning an attempt (`MAX_AGE_MS` still bounds
