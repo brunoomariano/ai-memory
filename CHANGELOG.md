@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Handoff selection no longer strands a detailed manual handoff behind a vague
+  auto one. A manual handoff (`memory_handoff_begin`) typically has no cwd while
+  the SessionEnd auto handoff carries the session cwd; the read filtered by exact
+  `cwd` equality, so the next session — whose SessionStart hook always sends a
+  cwd — silently skipped the cwd-less manual handoff and consumed the cwd-bearing
+  auto one instead, leaving the manual one open but unreachable (handoffs have no
+  list/search surface). Selection now prefers a manual handoff over an auto one
+  deterministically: `memory_handoff_begin` always stores a null
+  `from_session_id` and the SessionEnd auto handoff always a non-null one, so
+  manual handoffs are treated as project-wide (always candidates, whatever cwd
+  they carry) and an explicit baton beats the heuristic one regardless of whether
+  the model passed a cwd. Among manual handoffs the most recent wins. Auto
+  handoffs are scoped by a cwd path-boundary (a handoff left in `/repo` reaches a
+  session in `/repo/api`, never `/repo-other`), with the most specific cwd then
+  the most recent as tiebreaks — the cwd-specificity tiebreak applies only to
+  auto handoffs, never reordering manual ones. The path-boundary is computed in
+  Rust, not SQL `LIKE`, so `%`/`_` in a path cannot act as wildcards.
+  The stored cwd is normalized (trailing slash stripped) at insert time so
+  trailing-slash drift between agent payloads cannot break the match.
+  Cross-project isolation is unchanged: handoffs remain scoped by `workspace_id`
+  + `project_id`.
+
 ## [1.1.1] - 2026-06-18
 
 ### Fixed

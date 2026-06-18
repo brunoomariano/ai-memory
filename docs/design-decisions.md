@@ -167,7 +167,7 @@ struct Handoff {
 }
 ```
 
-MCP tools `memory_handoff_begin` (writes a handoff row tagged `state=open`), `memory_handoff_accept` (acknowledges, returns the handoff content, marks `accepted_by`), and `memory_handoff_cancel` (marks an exact open handoff id expired when it was created by mistake). The user can stop Claude Code, start Codex, and Codex's session-start hook fetches the latest open handoff for the cwd.
+MCP tools `memory_handoff_begin` (writes a handoff row tagged `state=open`), `memory_handoff_accept` (acknowledges, returns the handoff content, marks `accepted_by`), and `memory_handoff_cancel` (marks an exact open handoff id expired when it was created by mistake). The user can stop Claude Code, start Codex, and Codex's session-start hook fetches the open handoff for the cwd. The cwd is matched by path-boundary (the prior art's check), not exact equality: a handoff left in `/repo` is delivered to a session in `/repo/api`, but never to `/repo-other`. A manual `memory_handoff_begin` handoff is stored with no cwd and so is project-wide, and is preferred over the auto SessionEnd handoff (then the most specific cwd, then the most recent) so an explicit "where we left off" baton is never shadowed by the heuristic one.
 
 agentmemory has this informally (`/handoff` skill); we make it explicit from day one because every research report flagged cross-agent as the v0.1 weak spot.
 
