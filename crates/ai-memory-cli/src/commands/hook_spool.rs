@@ -269,7 +269,15 @@ pub async fn drain(
             }
 
             let payload = batch_payload(&items[idx..end]);
-            match post_batch(&client, &base, &payload, bearer.as_deref(), per_event_timeout).await {
+            match post_batch(
+                &client,
+                &base,
+                &payload,
+                bearer.as_deref(),
+                per_event_timeout,
+            )
+            .await
+            {
                 BatchOutcome::Accepted(k) => {
                     let k = k.min(end - idx);
                     for (path, _) in &items[idx..idx + k] {
@@ -774,7 +782,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
         for i in 0..3 {
-            write_spool_entry(&spool, &format!("evt-{i}.json"), format!("http://{addr}/hook?event=e{i}"));
+            write_spool_entry(
+                &spool,
+                &format!("evt-{i}.json"),
+                format!("http://{addr}/hook?event=e{i}"),
+            );
         }
 
         let r = drain(
@@ -803,7 +815,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
         for i in 0..2 {
-            write_spool_entry(&spool, &format!("evt-{i}.json"), format!("http://{addr}/hook?event=e{i}"));
+            write_spool_entry(
+                &spool,
+                &format!("evt-{i}.json"),
+                format!("http://{addr}/hook?event=e{i}"),
+            );
         }
 
         let r = drain(

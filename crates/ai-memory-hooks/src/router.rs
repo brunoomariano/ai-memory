@@ -1648,7 +1648,11 @@ mod tests {
             .unwrap();
         let parent = state
             .writer
-            .get_or_create_project(ws, String::from("my_app"), Some(String::from("/repo/my_app")))
+            .get_or_create_project(
+                ws,
+                String::from("my_app"),
+                Some(String::from("/repo/my_app")),
+            )
             .await
             .unwrap();
 
