@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-06-23
+
 ### Fixed
 - Hook spool batch drains now scale the `/hook/batch` request timeout with the
   number of events in the chunk, reducing false timeout retries after a slow
@@ -1344,7 +1346,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.2.1
 [1.2.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.2.0
 [1.1.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.1.3
 [1.1.2]: https://github.com/akitaonrails/ai-memory/compare/v1.1.1...v1.1.2
