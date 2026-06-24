@@ -173,12 +173,13 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
             AgentChoice::Openclaw => openclaw_plugin::apply(&server_url, auth, &args),
         };
     }
+    let strategy = args.project_strategy.baked();
     match args.agent {
         AgentChoice::OpenCode => render_opencode_plugin(&server_url, auth),
         AgentChoice::Omp => render_omp_extension(&server_url, auth),
         AgentChoice::ClaudeCode => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-            render_claude_code(&hooks_dir, &server_url, auth, &config.data_dir)
+            render_claude_code(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Codex => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
@@ -198,7 +199,7 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
         }
         AgentChoice::Grok => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-            render_grok(&hooks_dir, &server_url, auth, &config.data_dir)
+            render_grok(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Openclaw => {
             openclaw_plugin::render(&server_url, auth);
@@ -467,11 +468,13 @@ fn apply_to_claude_code_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "claude-code")?;
     let command_dir = staged_command_dir(&staged, "claude-code");
+    let strategy = args.project_strategy.baked();
     let payload = build_claude_code_payload_with_data_dir(
         &command_dir,
         server_url,
         auth_token,
         Some(data_dir),
+        strategy,
     );
     let our_hooks = payload
         .get("hooks")
@@ -529,8 +532,14 @@ fn apply_to_grok_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "grok")?;
     let command_dir = staged_command_dir(&staged, "grok");
-    let payload =
-        build_grok_payload_with_data_dir(&command_dir, server_url, auth_token, Some(data_dir));
+    let strategy = args.project_strategy.baked();
+    let payload = build_grok_payload_with_data_dir(
+        &command_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
     let our_hooks = payload
         .get("hooks")
         .and_then(|v| v.as_object())
@@ -598,7 +607,15 @@ fn apply_to_codex_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "codex")?;
     let command_dir = staged_command_dir(&staged, "codex");
-    let outcome = merge_codex_hooks(&command_dir, server_url, auth_token, data_dir, &path)?;
+    let strategy = args.project_strategy.baked();
+    let outcome = merge_codex_hooks(
+        &command_dir,
+        server_url,
+        auth_token,
+        data_dir,
+        strategy,
+        &path,
+    )?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -628,6 +645,7 @@ fn merge_codex_hooks(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    project_strategy: Option<&str>,
     config_path: &Path,
 ) -> Result<ApplyOutcome> {
     // Build the Codex-flavoured payload. The JSON shape is identical
@@ -640,6 +658,7 @@ fn merge_codex_hooks(
         auth_token,
         "codex",
         Some(data_dir),
+        project_strategy,
     );
     let our_hooks = payload
         .get("hooks")
@@ -699,7 +718,15 @@ fn apply_to_cursor_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "cursor")?;
     let command_dir = staged_command_dir(&staged, "cursor");
-    let outcome = merge_cursor_hooks(&command_dir, server_url, auth_token, data_dir, &path)?;
+    let strategy = args.project_strategy.baked();
+    let outcome = merge_cursor_hooks(
+        &command_dir,
+        server_url,
+        auth_token,
+        data_dir,
+        strategy,
+        &path,
+    )?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -718,6 +745,7 @@ fn merge_cursor_hooks(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    project_strategy: Option<&str>,
     config_path: &Path,
 ) -> Result<ApplyOutcome> {
     let payload = build_profile_payload_for_agent(
@@ -727,6 +755,7 @@ fn merge_cursor_hooks(
         auth_token,
         "cursor",
         Some(data_dir),
+        project_strategy,
     );
     let our_hooks = payload
         .get("hooks")
@@ -781,7 +810,15 @@ fn apply_to_gemini_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "gemini-cli")?;
     let command_dir = staged_command_dir(&staged, "gemini-cli");
-    let outcome = merge_gemini_hooks(&command_dir, server_url, auth_token, data_dir, &path)?;
+    let strategy = args.project_strategy.baked();
+    let outcome = merge_gemini_hooks(
+        &command_dir,
+        server_url,
+        auth_token,
+        data_dir,
+        strategy,
+        &path,
+    )?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -800,6 +837,7 @@ fn merge_gemini_hooks(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    project_strategy: Option<&str>,
     config_path: &Path,
 ) -> Result<ApplyOutcome> {
     let payload = build_profile_payload_for_agent(
@@ -809,6 +847,7 @@ fn merge_gemini_hooks(
         auth_token,
         "gemini-cli",
         Some(data_dir),
+        project_strategy,
     );
     let our_hooks = payload
         .get("hooks")
@@ -855,7 +894,15 @@ fn apply_to_antigravity_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "antigravity-cli")?;
     let command_dir = staged_command_dir(&staged, "antigravity-cli");
-    let outcome = merge_antigravity_hooks(&command_dir, server_url, auth_token, data_dir, &path)?;
+    let strategy = args.project_strategy.baked();
+    let outcome = merge_antigravity_hooks(
+        &command_dir,
+        server_url,
+        auth_token,
+        data_dir,
+        strategy,
+        &path,
+    )?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -874,10 +921,16 @@ fn merge_antigravity_hooks(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    project_strategy: Option<&str>,
     config_path: &Path,
 ) -> Result<ApplyOutcome> {
-    let payload =
-        build_antigravity_payload_with_data_dir(staged, server_url, auth_token, Some(data_dir));
+    let payload = build_antigravity_payload_with_data_dir(
+        staged,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
     let our_group = payload
         .get("ai-memory")
         .and_then(|v| v.as_object())
@@ -1846,6 +1899,7 @@ fn render_claude_code(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    project_strategy: Option<&str>,
 ) -> Result<()> {
     // Soft check: warn (don't bail) if a script is missing. The user
     // may be running this command inside docker against a host path
@@ -1864,8 +1918,13 @@ fn render_claude_code(
             );
         }
     }
-    let payload =
-        build_claude_code_payload_with_data_dir(hooks_dir, server_url, auth_token, Some(data_dir));
+    let payload = build_claude_code_payload_with_data_dir(
+        hooks_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing claude code hook config")?;
     println!("# Claude Code hook config — merge into ~/.claude/settings.json");
@@ -1885,6 +1944,7 @@ fn render_grok(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    project_strategy: Option<&str>,
 ) -> Result<()> {
     // Soft check (same rationale as render_claude_code): warn, don't bail,
     // so the docker host-path flow still works.
@@ -1901,8 +1961,13 @@ fn render_grok(
             );
         }
     }
-    let payload =
-        build_grok_payload_with_data_dir(hooks_dir, server_url, auth_token, Some(data_dir));
+    let payload = build_grok_payload_with_data_dir(
+        hooks_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing grok hook config")?;
     println!("# Grok Build CLI hook config — write to ~/.grok/hooks/ai-memory.json");
@@ -1923,6 +1988,7 @@ fn render_grok(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::ProjectStrategyArg;
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]
@@ -2034,6 +2100,7 @@ mod tests {
             as_user: None,
             apply: true,
             config_file: None,
+            project_strategy: ProjectStrategyArg::Basename,
         }
     }
 
@@ -2681,6 +2748,7 @@ model = "gpt-5"
             as_user: None,
             apply: true,
             config_file: Some(tmp.path().join("extensions").join("ai-memory.ts")),
+            project_strategy: ProjectStrategyArg::Basename,
         };
 
         let path = resolve_omp_extension_path(&args).unwrap();
@@ -2769,6 +2837,7 @@ model = "gpt-5"
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            None,
             &config_path,
         )
         .unwrap();
@@ -2816,6 +2885,7 @@ model = "gpt-5"
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            None,
             &config_path,
         )
         .unwrap();
@@ -2830,6 +2900,7 @@ model = "gpt-5"
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            None,
             &config_path,
         )
         .unwrap();
@@ -2865,6 +2936,7 @@ model = "gpt-5"
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            None,
             &config_path,
         )
         .unwrap();
@@ -2910,6 +2982,7 @@ model = "gpt-5"
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            None,
             &config_path,
         )
         .unwrap();
@@ -2954,6 +3027,7 @@ model = "gpt-5"
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            None,
             &config_path,
         )
         .unwrap();
@@ -3012,6 +3086,7 @@ model = "gpt-5"
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            None,
             &config_path,
         )
         .unwrap();
@@ -3063,6 +3138,7 @@ model = "gpt-5"
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            None,
             &config_path,
         )
         .unwrap();
@@ -3077,6 +3153,7 @@ model = "gpt-5"
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            None,
             &config_path,
         )
         .unwrap();
