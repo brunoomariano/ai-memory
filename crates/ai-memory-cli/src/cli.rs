@@ -1032,6 +1032,35 @@ pub struct LlmTestArgs {
     pub api_key: Option<String>,
 }
 
+/// Project-resolution strategy to bake into installed hooks.
+///
+/// `basename` (the default) bakes nothing — generated hooks behave
+/// exactly as before. `repo-root` bakes a default so every session
+/// resolves its project from the main git repo root (collapsing
+/// subdirectories and worktrees) without a per-repo `.ai-memory.toml`
+/// marker. A marker's own `project_strategy` still wins.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ProjectStrategyArg {
+    /// `project = basename(cwd)` — the default; bakes nothing.
+    Basename,
+    /// `project = basename(main git repo root)` — collapses subdirs/worktrees.
+    /// clap renders this value as `repo-root`.
+    RepoRoot,
+}
+
+impl ProjectStrategyArg {
+    /// Normalize to what the hook command should bake. `None` bakes
+    /// nothing (behavior unchanged); `Some("repo-root")` bakes the
+    /// repo-root default into the generated hooks.
+    #[must_use]
+    pub fn baked(self) -> Option<&'static str> {
+        match self {
+            Self::Basename => None,
+            Self::RepoRoot => Some("repo-root"),
+        }
+    }
+}
+
 /// Arguments for `hook` — emit one lifecycle event natively.
 #[derive(Debug, Args)]
 pub struct HookArgs {
@@ -1047,6 +1076,11 @@ pub struct HookArgs {
     /// Optional bearer token (`Authorization: Bearer <token>`).
     #[arg(long, hide_env_values = true)]
     pub auth_token: Option<String>,
+    /// Default project strategy baked in by `install-hooks
+    /// --project-strategy`. Applies only when a `.ai-memory.toml`
+    /// marker does not pin its own `project_strategy`.
+    #[arg(long)]
+    pub project_strategy: Option<String>,
 }
 
 /// Arguments for `install-hooks`.
@@ -1104,6 +1138,14 @@ pub struct InstallHooksArgs {
     /// For OpenClaw, this is the generated plugin package directory.
     #[arg(long)]
     pub config_file: Option<PathBuf>,
+    /// Default project strategy to bake into the installed hooks.
+    /// `repo-root` makes every session resolve its project from the main
+    /// git repo root (collapsing subdirectories and worktrees) without a
+    /// per-repo `.ai-memory.toml` marker. A marker's own `project_strategy`
+    /// still wins. Defaults to `basename`, which bakes nothing and is
+    /// identical to prior behavior.
+    #[arg(long, value_enum, default_value_t = ProjectStrategyArg::Basename)]
+    pub project_strategy: ProjectStrategyArg,
 }
 
 /// Arguments for `install-mcp`.
