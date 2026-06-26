@@ -2616,6 +2616,16 @@ mod tests {
                 && snippet.contains("ai-memory install-instructions"),
             "snippet must preserve refresh/install guidance"
         );
+        let refresh_guidance = snippet
+            .split("### Refreshing this snippet")
+            .nth(1)
+            .expect("snippet must keep refresh guidance");
+        assert!(
+            refresh_guidance.contains("managed_skills")
+                && refresh_guidance.contains("target_hints")
+                && refresh_guidance.contains("relative_path"),
+            "snippet must tell agents to refresh managed skill files"
+        );
         assert!(
             snippet.contains(ai_memory_core::MARKER_START)
                 && snippet.contains(ai_memory_core::MARKER_END),

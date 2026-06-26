@@ -9,9 +9,9 @@
 //! - `ai-memory-cli`'s `install-instructions` subcommand — writes the
 //!   block into `./CLAUDE.md` directly from the host.
 //! - `ai-memory-mcp`'s `memory_install_self_routing` MCP tool — returns
-//!   the block to the agent, which then uses its own Write/Edit tool
-//!   to land it in the target file (the MCP server can't reach the
-//!   agent's host filesystem).
+//!   the block plus managed skill files to the agent, which then uses its
+//!   own Write/Edit tool to update the target file and skill root (the MCP
+//!   server can't reach the agent's host filesystem).
 //!
 //! Keeping the snippet in one constant means "what gets written" stays
 //! consistent across both paths; updating it once propagates.
@@ -69,8 +69,11 @@ latest binary's recommended copy:
 - **From the agent** (no terminal needed): ask "refresh the ai-memory
   routing in this project". The agent calls `memory_install_self_routing`,
   picks the right filename for itself (Claude Code -> `CLAUDE.md`; Codex /
-  OpenCode / Cursor / Gemini -> `AGENTS.md`), and uses its Write / Edit
-  tool to land the block.
+  OpenCode / Cursor / Gemini -> `AGENTS.md`), uses its Write / Edit tool
+  to replace or append the returned `markered_block` while preserving
+  non-ai-memory user content, then writes or updates each returned
+  `managed_skills` item under the selected skill root from `target_hints`
+  using its `relative_path`.
 - **From the CLI**: `ai-memory install-instructions` (defaults to
   `CLAUDE.md`; pass `--target AGENTS.md` for non-Claude agents or projects
   that use `AGENTS.md` as the canonical instruction file).
