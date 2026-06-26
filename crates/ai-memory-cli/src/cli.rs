@@ -112,6 +112,8 @@ pub enum Command {
     /// `<!-- ai-memory:end -->` markers so re-running replaces the
     /// block in place without duplicating.
     InstallInstructions(InstallInstructionsArgs),
+    /// Install core-managed ai-memory Agent Skills into agent skill directories.
+    InstallSkills(InstallSkillsArgs),
     /// Retro-fit existing sessions + observations to per-cwd projects
     /// based on the cwd captured at session-start. Pages are marked
     /// `is_latest=false` (they were a multi-project mash-up) so the
@@ -439,6 +441,50 @@ pub struct InstallInstructionsArgs {
     /// the file.
     #[arg(long)]
     pub print: bool,
+}
+
+/// Skill install scope for `install-skills`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InstallSkillsScope {
+    /// Install into this project's agent skill directories.
+    Project,
+    /// Install into the user's global agent skill directories.
+    Global,
+}
+
+/// Agent skill directory family for `install-skills`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InstallSkillsAgent {
+    /// Claude Code's `.claude/skills` directory.
+    ClaudeCode,
+    /// Cross-agent `.agents/skills` directory.
+    Agents,
+    /// Install into both Claude Code and `.agents` skill directories.
+    Both,
+}
+
+/// Arguments for `install-skills`.
+#[derive(Debug, Args)]
+pub struct InstallSkillsArgs {
+    /// Install project-local skills or global user skills.
+    #[arg(long, value_enum, default_value_t = InstallSkillsScope::Project)]
+    pub scope: InstallSkillsScope,
+    /// Which agent skill directory family to install into.
+    #[arg(long, value_enum, default_value_t = InstallSkillsAgent::ClaudeCode)]
+    pub agent: InstallSkillsAgent,
+    /// Override the skill root directory. When set, `--scope` and
+    /// `--agent` are ignored and the managed skill directories are
+    /// written below this root.
+    #[arg(long)]
+    pub target_dir: Option<PathBuf>,
+    /// Print target paths and SKILL.md contents without writing files.
+    #[arg(long)]
+    pub print: bool,
+    /// Overwrite same-named existing skills that do not contain the
+    /// ai-memory managed marker. Without this flag, unmanaged skills
+    /// are preserved and the command exits with an actionable error.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `bootstrap`.
