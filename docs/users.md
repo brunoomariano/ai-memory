@@ -302,9 +302,11 @@ the bearer authenticates, attribution flows from the token's owner
   for every `/admin/*` endpoint. DB users created with `user add` are
   normal users, not additional admins.
 - **OIDC is request authentication, not page authorization.** Native hooks and
-  thin-client CLI commands can use a per-developer OIDC device token, but
-  ai-memory still has one shared wiki per server and no per-page RBAC. The
-  Keycloak/OIDC `sid` claim is also not an ai-memory agent session id; session
-  auto-scope needs the lifecycle-hook session id or explicit `workspace` +
-  `project` / `scopes`. If you need data isolation, run separate ai-memory
-  servers or isolate at a reverse proxy.
+  thin-client CLI commands can send a per-developer OIDC bearer for an external
+  OIDC-aware gateway/bridge. Native ai-memory server auth still uses static root
+  bearer / DB-user tokens, and `/admin/*` stays root-only unless a gateway
+  translates accepted OIDC auth into upstream auth that ai-memory accepts.
+  ai-memory still has one shared wiki per server and no
+  per-page RBAC. The Keycloak/OIDC `sid` claim is also not an ai-memory agent
+  session id; session auto-scope needs the lifecycle-hook session id or explicit
+  `workspace` + `project` / `scopes`.

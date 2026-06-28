@@ -37,10 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Thin-client HTTP CLI commands (`status`, `search`, `read-page`, `write-page`,
-  `delete-page`, `backup`, `embed`, `reindex`, and related admin commands) now
-  fall back to a stored OIDC device-flow token from `auth.json` when
-  `AI_MEMORY_AUTH_TOKEN` / `[auth].bearer_token` is absent. Static bearer tokens
-  still take precedence.
+  `delete-page`, `backup`, `embed`, and related admin commands) now fall back to
+  a stored OIDC device-flow token from `auth.json` when `AI_MEMORY_AUTH_TOKEN` /
+  `[auth].bearer_token` is absent. This sends a bearer for external OIDC-aware
+  gateways/bridges; native ai-memory server auth still uses the static root
+  bearer or DB-user tokens, and `/admin/*` remains root-only unless a gateway
+  translates accepted OIDC auth into upstream auth that ai-memory accepts.
+  Static bearer tokens still take precedence.
 
 ## [1.3.0] - 2026-06-24
 

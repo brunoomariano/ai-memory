@@ -376,7 +376,10 @@ wrapper keeps shell-script hooks by default; set up OIDC from a native release
 binary or source install. Thin-client HTTP commands such as `ai-memory status`
 and `ai-memory search` also use the stored OIDC access token when no static
 `AI_MEMORY_AUTH_TOKEN` / `[auth].bearer_token` is configured; the static bearer
-still wins when present.
+still wins when present. This is for OIDC-aware gateways/bridges; native
+ai-memory server auth still accepts static root bearer / DB-user tokens, and
+`/admin/*` remains root-only unless a gateway translates accepted OIDC auth into
+upstream auth that ai-memory accepts.
 
 OIDC/Keycloak session ids are login-provider sessions, not ai-memory agent
 sessions. Shared servers that rely on `[auto_scope]` session isolation still

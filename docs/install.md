@@ -325,7 +325,10 @@ ai-memory auth login oidc-device \
 The stored OIDC access token is also used by thin-client HTTP commands
 (`status`, `search`, `read-page`, `write-page`, `backup`, `embed`, and
 similar) when no static `AI_MEMORY_AUTH_TOKEN` / `[auth].bearer_token` is
-configured. Static bearer auth still has precedence.
+configured. Static bearer auth still has precedence. This is for external
+OIDC-aware gateways/bridges; native ai-memory server auth still uses static root
+bearer / DB-user tokens, and `/admin/*` remains root-only unless a gateway
+translates accepted OIDC auth into upstream auth that ai-memory accepts.
 
 OIDC/Keycloak `sid` claims describe the login provider's session, not the
 coding-agent session ai-memory uses for `[auto_scope]` isolation. Gateways may

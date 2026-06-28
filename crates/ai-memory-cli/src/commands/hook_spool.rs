@@ -583,6 +583,18 @@ mod tests {
         assert_eq!(a.auth_mode, AuthMode::Anonymous);
     }
 
+    #[tokio::test]
+    async fn resolve_bearer_delegates_static_and_absent_oidc_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::new();
+
+        let static_bearer = resolve_bearer(&client, tmp.path(), Some("static-token")).await;
+        let absent_bearer = resolve_bearer(&client, tmp.path(), None).await;
+
+        assert_eq!(static_bearer.as_deref(), Some("static-token"));
+        assert!(absent_bearer.is_none());
+    }
+
     #[test]
     fn enqueue_then_list_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
